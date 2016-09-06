@@ -1,8 +1,8 @@
 var balls = [], blocks = [];
 colors = ['red', 'green', 'blue', 'orange', 'yellow', 'magenta', 'black', 'purple', 'gray', 'violet']
 notes = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
-values = [4, 2, 1] //{whole: 4, half: 2, quarter:1};
-dirs = [[4, -3],[-4, -3], [2, -3], [-2, -3]];
+values = [16, 4, 1] //{whole: 4, half: 2, quarter:1};
+dirs = [[4, -3],[-4, -3], [0, 0],[2, -3], [-2, -3]];
 piano = Synth.createInstrument('piano');
 
 ///////////////////  Mouse Interaction  ////////////////////
@@ -19,9 +19,16 @@ function onMouseDown(event){
 ///////////////////  Initialize  ////////////////////////
 
 drawCoordinateSystem();
-createRandomBalls(5);
+//createRandomBalls(5);
+var ballTimer = setInterval(function() {createRandomBalls(1)}, 1000);
+var blockTimer = setInterval(function() {createRandomBlock()}, 5000);
+
 
 ///////////////// Note processing ///////////////////////
+
+
+
+//var oldTime = new Date().getTime();
 
 function showNote(xCoor, color){
     var res = obtainNote(xCoor)
@@ -37,6 +44,10 @@ function showNote(xCoor, color){
             this.remove()
     }
     piano.play(res.note, res.octave, 2); // plays C4 for 2s using the 'piano' sound profile 
+    
+//    var now = new Date().getTime();
+//    console.log(now - oldTime)
+//    oldTime = now;
 }
 
 function obtainNote(xCoor){
@@ -59,8 +70,8 @@ function Ball(type, p, v ){
     var tempObj = this;
     
     this.id = Ball.id++;     
-    this.radius = 40 / values[type];
-    this.gravity = 0.25 * values[type]
+    this.radius = 40 / Math.sqrt(values[type]);
+    this.gravity = 0.5 * values[type]
  	this.path = new Path.Circle({center: p, radius: this.radius, fillColor: colors[this.id], opacity: (this.gravity + 0.3)});
 	
     this.vector = v; //new Point(0.8,0.5)
@@ -77,13 +88,13 @@ function Ball(type, p, v ){
         // Check if it is in the arena
         if(pos.x + radius >= view.size.width || pos.x - radius <= 0)
             this.vector *= [-1, 1];
-        if(pos.y + radius > view.size.height)
+        if(pos.y + radius >= view.size.height)
         {
             this.path.position.y = this.oldState.oldY
             this.vector = this.oldState.vector * [1, -1]
             showNote(pos.x, colors[this.id])
         }
-        if(pos.y - radius < 0)
+        if(pos.y - radius <= 0)
             this.vector *= [1, -1];
         
         this.oldState = {vector: this.vector, oldY: pos.y};        
@@ -148,25 +159,36 @@ function Ball(type, p, v ){
 };
 
 
-//////////////// math functions  ////////////////////////
+//////////////// functions  /////////////////////////////
 
 function getRandomInt(min, max) {
     return Math.floor(Math.random() * (max - min)) + min;
 }
 
-//////////////// functions  /////////////////////////////
-
-
 function createRandomBalls(count){
     for (var i = 0; i < count; i++) {
-        var position = convertToRealCoord(new Point(getRandomInt(0, 25), 10))
+        var position = convertToRealCoord(new Point(getRandomInt(0, 25), 10.5))
         
-        var s = getRandomInt(0, 2)
+        var s = getRandomInt(0, 3)
         var vector = new Point(dirs[s][0], dirs[s][1])
         
         var type = getRandomInt(0, 3)
         balls.push(new Ball(type, position, vector));
     }
+    
+    if(balls.length == 5)
+        clearInterval(ballTimer)
+}
+
+function createRandomBlock(){
+    
+    var p = getRandomInt(1, 4) * 240;
+    var s = getRandomInt( -100, 100);
+    var dd = new Path.Line({from: [p+s, 0], to: [p+s, view.size.height], strokeWidth:2, strokeColor: 'black'})
+    blocks.push(dd)
+    
+    if(blocks.length == 3)
+        clearInterval(blockTimer)
 }
 
 function convertToRealCoord(p){
@@ -178,7 +200,7 @@ function convertToRealCoord(p){
 
 function drawCoordinateSystem(){
     
-    image = new Raster({ source: 'css/music/llustration-of-piano-keys-v2.png'});
+    image = new Raster({ source: 'css/llustration-of-piano-keys-v2.png'});
     image.matrix = new Matrix(0.94, 0, 0, 1, 0, view.size.height-40)
     image.translate([420,0])
     
