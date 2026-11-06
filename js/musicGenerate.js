@@ -47,6 +47,7 @@
     choreoReuse: 'max',
     choreoTolerance: 0.1,
     choreoTilt: 12,
+    choreoWalls: true,
     choreoMaxHop: 0.8,
     choreoMaxSpeed: 14,
     choreoSize: 'mixed',
@@ -117,6 +118,9 @@
         visible: function () { return S.choreoReuse !== 'none'; } },
       { key: 'choreoTilt', type: 'range', label: 'Tuş eğimi', min: 0, max: 25, step: 1, fmt: function (v) { return Math.round(v) + '°'; },
         hint: 'Basılan tuşun eğimi topu en fazla bu açının iki katı döndürebilir; yakın tuşlara geçişi bu sağlar. 0°: top yön değiştirmez.',
+        visible: function () { return S.choreoReuse === 'max'; } },
+      { key: 'choreoWalls', type: 'toggle', label: 'Duvarlardan yansıyabilsin',
+        hint: 'Top yan duvarlara ayna gibi çarpıp yön değiştirerek uzak ya da geri yöndeki tuşa geçebilir.',
         visible: function () { return S.choreoReuse === 'max'; } },
       { key: 'choreoMaxHop', type: 'range', label: 'Azami sıçrama yüksekliği', min: 0.1, max: 1, step: 0.05, fmt: fmtPct,
         hint: 'Boş yüksekliğe göre. Uzun aralar yüksek sıçrama ister; sığmayan nota yeni topla çalınır.', visible: function () { return S.choreoReuse !== 'none'; } },
@@ -245,7 +249,7 @@
       case 'scale': case 'root': case 'baseOctave': case 'octaves': buildKeys(); break;
       case 'mode': case 'song': case 'customSong': loadSong(key === 'mode'); break;
       case 'gravity': case 'tempo': if (S.mode === 'choreo') renderModeStatus(); break;
-      case 'choreoReuse': case 'choreoTolerance': case 'choreoTilt': case 'choreoMaxHop': case 'choreoMaxSpeed': case 'restitution':
+      case 'choreoReuse': case 'choreoTolerance': case 'choreoTilt': case 'choreoWalls': case 'choreoMaxHop': case 'choreoMaxSpeed': case 'restitution':
       case 'choreoSize': case 'launchFrom': case 'launchSpread': case 'launchHeight':
         if (S.mode === 'choreo') { restartSong(); renderModeStatus(); }
         break;
@@ -373,9 +377,13 @@
       var T = Math.max(2, (next.beat - songBeat) * framesPerBeat());
       var idx = keyIndexOfMidi(next.midi);
       var vxIn = b.vx, vyNatural = -b.vy;      // after the bounce: |vy| = e · impact
-      b.vx = (keyCenter(idx) - b.x) / T;
+      var landErr = Math.abs(b.x - keyCenter(keyIndexOfMidi(b.midi)));
+      var prevVia = b.via;
+      b.vx = hopVelocity(next.via, b.x, keyCenter(idx), T, b.r, b.e).out;
+      b.via = next.via;
+      b.mirrored = false;
       b.vy = -b.g * T / 2;
-      if (debugHit) debugHit({ vyNatural: vyNatural, vyOut: -b.vy, vxIn: vxIn, vxOut: b.vx });
+      if (debugHit) debugHit({ vyNatural: vyNatural, vyOut: -b.vy, vxIn: vxIn, vxOut: b.vx, via: next.via, prevVia: prevVia, landErr: landErr });
       b.midi = next.midi;
       b.noteBeats = next.beats;
       b.hopCooldown = T * 0.5;
@@ -489,6 +497,19 @@
    * Repeated notes and evenly timed steps to nearby keys chain naturally;
    * everything else gets its own ball.
    */
+  // Ways to fly from one key to the next: straight, or mirrored once off a side wall.
+  var VIA_DIRECT = 0, VIA_RIGHT = 1, VIA_LEFT = 2;
+
+  // Horizontal speed leaving x1 and arriving at x2 after T frames along `via`.
+  // A wall returns e of the horizontal speed, like the floor does vertically.
+  function hopVelocity(via, x1, x2, T, r, e) {
+    if (via === VIA_DIRECT) { var v = (x2 - x1) / T; return { out: v, inn: v }; }
+    var wall = via === VIA_RIGHT ? W - r : r;
+    var d1 = Math.abs(wall - x1), d2 = Math.abs(wall - x2);
+    var out = (d1 + d2 / e) / T * (via === VIA_RIGHT ? 1 : -1);
+    return { out: out, inn: -e * out };
+  }
+
   function planChoreo() {
     var fpb = framesPerBeat();
     var drop = dropPlan();
@@ -496,8 +517,10 @@
     var tol = S.choreoTolerance;
     var tilt = S.choreoReuse === 'max' ? Math.tan(2 * S.choreoTilt * Math.PI / 180) : 0;
     var canHop = drop.g >= 0.02 && S.choreoReuse !== 'none';
+    var vias = S.choreoReuse === 'max' && S.choreoWalls ? [VIA_DIRECT, VIA_RIGHT, VIA_LEFT] : [VIA_DIRECT];
     var maxHop = S.choreoMaxHop * drop.room;
     var maxT = canHop ? Math.sqrt(8 * maxHop / drop.g) : 0;   // longest hop that fits under the limit
+    var rPlan = SIZES[1].r * S.ballScale;                     // walls are aimed again with the real radius
 
     var P = [];
     song.notes.forEach(function (n) {
@@ -507,67 +530,85 @@
     });
     var N = P.length;
     var alive = P.map(function () { return true; });
+    var V = vias.length;
 
-    // One hop a -> b is possible on its own.
-    function hopOK(a, b) {
+    // One hop a -> b along a given path, or null if it isn't possible on its own.
+    function hop(a, b, via) {
       var T = b.t - a.t;
-      if (T < 4 || T > maxT) return false;
-      var dx = b.x - a.x;
-      if (S.choreoReuse === 'repeat' && dx !== 0) return false;
-      return Math.abs(dx / T) <= S.choreoMaxSpeed;
+      if (T < 4 || T > maxT) return null;
+      if (S.choreoReuse === 'repeat' && b.x !== a.x) return null;
+      var v = hopVelocity(via, a.x, b.x, T, rPlan, e);
+      if (Math.abs(v.out) > S.choreoMaxSpeed) return null;
+      return v;
     }
-    // Hop b -> c can follow hop a -> b: bounce energy and key tilt allow it.
-    function followOK(a, b, c) {
-      var T1 = b.t - a.t, T2 = c.t - b.t;
+    // The bounce at b, between arriving with vIn (after hop of length T1) and
+    // leaving with vOut (hop of length T2), respects energy and key tilt.
+    function bounceOK(T1, vIn, T2, vOut) {
       if (Math.abs(T2 - e * T1) > tol * e * T1 + 1e-9) return false;
-      var dVx = Math.abs((c.x - b.x) / T2 - (b.x - a.x) / T1);
-      return dVx <= tilt * drop.g * T2 / 2 + 1e-9;
+      return Math.abs(vOut - vIn) <= tilt * drop.g * T2 / 2 + 1e-9;
     }
 
     var chains = [];
     while (canHop) {
-      // best[i*N+j] = longest chain (in notes) whose last two notes are i, j.
-      var best = new Map(), bestLen = 0, bestEnd = null;
+      // best[(i*N+j)*V+v] = longest chain whose last hop is i -> j along vias[v].
+      var best = new Map(), bestKey = -1, bestLen = 0, bestWalls = 0;
       for (var j = 0; j < N; j++) {
         if (!alive[j]) continue;
         for (var i = j - 1; i >= 0 && P[j].t - P[i].t <= maxT; i--) {
-          if (!alive[i] || !hopOK(P[i], P[j])) continue;
-          var len = 2, prev = -1;
-          for (var k = i - 1; k >= 0 && P[i].t - P[k].t <= maxT; k--) {
-            var ki = best.get(k * N + i);
-            if (ki && ki.len + 1 > len && followOK(P[k], P[i], P[j])) { len = ki.len + 1; prev = k; }
+          if (!alive[i]) continue;
+          var T2 = P[j].t - P[i].t;
+          for (var v = 0; v < V; v++) {
+            var h2 = hop(P[i], P[j], vias[v]);
+            if (!h2) continue;
+            var len = 2, walls = v ? 1 : 0, prev = -1;
+            for (var k = i - 1; k >= 0 && P[i].t - P[k].t <= maxT; k--) {
+              for (var u = 0; u < V; u++) {
+                var st = best.get((k * N + i) * V + u);
+                if (!st) continue;
+                var cand = st.len + 1, candWalls = st.walls + (v ? 1 : 0);
+                if (cand < len || (cand === len && candWalls >= walls)) continue;
+                if (!bounceOK(P[i].t - P[k].t, st.vIn, T2, h2.out)) continue;
+                len = cand; walls = candWalls; prev = (k * N + i) * V + u;
+              }
+            }
+            var key = (i * N + j) * V + v;
+            best.set(key, { len: len, walls: walls, prev: prev, i: i, j: j, via: vias[v], vIn: h2.inn, vOut: h2.out });
+            if (len > bestLen || (len === bestLen && walls < bestWalls)) { bestLen = len; bestWalls = walls; bestKey = key; }
           }
-          best.set(i * N + j, { len: len, prev: prev });
-          if (len > bestLen) { bestLen = len; bestEnd = [i, j]; }
         }
       }
-      if (!bestEnd) break;
-      var seq = [bestEnd[1], bestEnd[0]], a = bestEnd[0], b = bestEnd[1];
-      while (true) {
-        var cur = best.get(a * N + b);
-        if (cur.prev < 0) break;
-        seq.push(cur.prev);
-        b = a; a = cur.prev;
+      if (bestKey < 0) break;
+      // Walk back: collect notes and the path used for every hop.
+      var idxs = [], hopVias = [], key2 = bestKey, firstOut = 0;
+      while (key2 >= 0) {
+        var stt = best.get(key2);
+        idxs.push(stt.j);
+        hopVias.push(stt.via);
+        firstOut = stt.vOut;
+        if (stt.prev < 0) idxs.push(stt.i);
+        key2 = stt.prev;
       }
-      seq.reverse();
-      seq.forEach(function (q) { alive[q] = false; });
-      chains.push({ notes: seq.map(function (q) { return P[q].note; }), points: seq.map(function (q) { return P[q]; }) });
+      idxs.reverse();
+      hopVias.reverse();
+      idxs.forEach(function (q) { alive[q] = false; });
+      chains.push({
+        notes: idxs.map(function (q) { return P[q].note; }),
+        vias: hopVias,                 // vias[h] = path of the hop into notes[h + 1]
+        firstPeriod: P[idxs[1]].t - P[idxs[0]].t,
+        firstVx: firstOut
+      });
     }
-    for (var q = 0; q < N; q++) if (alive[q]) chains.push({ notes: [P[q].note], points: [P[q]] });
+    for (var q = 0; q < N; q++) if (alive[q]) chains.push({ notes: [P[q].note], vias: [] });
 
+    var longest = 0, wallHops = 0;
     chains.forEach(function (c) {
       c.size = chainSize();
-      if (c.points.length >= 2) {
-        c.firstPeriod = c.points[1].t - c.points[0].t;
-        c.firstVx = (c.points[1].x - c.points[0].x) / c.firstPeriod;
-      }
       c.launch = launchFor(c, drop, e, fpb);
+      longest = Math.max(longest, c.notes.length);
+      c.vias.forEach(function (v) { if (v) wallHops++; });
     });
     chains.sort(function (x, y) { return x.notes[0].beat - y.notes[0].beat; });
-
-    var longest = 0;
-    chains.forEach(function (c) { longest = Math.max(longest, c.notes.length); });
-    return { chains: chains, notes: N, longest: longest, fpb: fpb };
+    return { chains: chains, notes: N, longest: longest, wallHops: wallHops, fpb: fpb };
   }
 
   // Where and how a chain's ball enters so that it reaches its first key on time.
@@ -644,9 +685,12 @@
       scripted: true,
       midi: first.midi,
       noteBeats: first.beats,
-      queue: chain.notes.slice(1).map(function (n) {
-        return { midi: n.midi, beats: n.beats, beat: n.beat + offset };
+      queue: chain.notes.slice(1).map(function (n, h) {
+        return { midi: n.midi, beats: n.beats, beat: n.beat + offset, via: chain.vias[h] || VIA_DIRECT };
       }),
+      e: Math.max(0.05, S.restitution),
+      via: VIA_DIRECT,
+      mirrored: false,
       spent: false,
       alpha: L.fadeIn ? 0 : 1,
       fadingIn: L.fadeIn
@@ -675,8 +719,13 @@
       if (b.x - b.r < 0) { b.x = b.r; b.vx = Math.abs(b.vx) * e; }
       else if (b.x + b.r > W) { b.x = W - b.r; b.vx = -Math.abs(b.vx) * e; }
       if (b.y - b.r < 0) { b.y = b.r; b.vy = Math.abs(b.vy) * e; }
-    } else if (b.hopCooldown > 0) {
-      b.hopCooldown -= h;
+    } else {
+      if (b.hopCooldown > 0) b.hopCooldown -= h;
+      // A side wall acts as a mirror only on a hop planned to use it, once.
+      if (!b.spent && !b.mirrored) {
+        if (b.via === VIA_LEFT && b.x < b.r) { b.x = 2 * b.r - b.x; b.vx = Math.abs(b.vx) * b.e; b.mirrored = true; }
+        else if (b.via === VIA_RIGHT && b.x > W - b.r) { b.x = 2 * (W - b.r) - b.x; b.vx = -Math.abs(b.vx) * b.e; b.mirrored = true; }
+      }
     }
 
     // Keyboard (floor).
@@ -1084,7 +1133,8 @@
       if (!plan || !plan.notes) cs.textContent = '';
       else if (S.choreoReuse !== 'none' && S.gravity < 0.02) cs.textContent = 'Yerçekimi olmadan top sıçrayamaz; her nota yeni top.';
       else cs.textContent = plan.notes + ' nota, ' + plan.chains.length + ' topla çalınıyor' +
-        (plan.chains.length < plan.notes ? ' (bir top en fazla ' + plan.longest + ' nota).' : '.') +
+        (plan.chains.length < plan.notes ? ' (bir top en fazla ' + plan.longest + ' nota' +
+          (plan.wallHops ? ', ' + plan.wallHops + ' geçişte duvar yansıması' : '') + ').' : '.') +
         (S.choreoReuse === 'max' && plan.longest < 4 ? ' Daha uzun zincirler için yerçekimini veya tuş eğimini artırın ya da tempoyu düşürün (değişiklik şarkı baştan başlayınca uygulanır).' : '');
     }
   }
