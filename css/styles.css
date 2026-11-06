@@ -307,3 +307,6 @@ select {
   .hint { display: none; }
   .brand h1 { font-size: 15px; }
 }
+
+.control-status[data-status="loading"] { color: var(--accent); }
+.control-status[data-status="error"] { color: #ff8a7a; }

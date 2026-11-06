@@ -25,8 +25,6 @@
     chromatic:  { label: 'Kromatik',         steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] }
   };
 
-  var INSTRUMENTS = [['piano', 'Piyano'], ['organ', 'Org'], ['acoustic', 'Akustik gitar'], ['edm', 'EDM']];
-
   // Three ball sizes. `g` multiplies gravity when "size-dependent gravity" is on,
   // so each size bounces with its own period and the result is polyrhythmic.
   var SIZES = [{ r: 10, g: 2.0 }, { r: 17, g: 1.0 }, { r: 26, g: 0.5 }];
@@ -55,8 +53,10 @@
     barrierInterval: 5,
 
     muted: false,
-    instrument: 'piano',
-    volume: 0.6,
+    instrument: 'grand',
+    volume: 0.7,
+    reverb: 0.25,
+    velocity: true,
     duration: 2,
     scale: 'major',
     root: 0,
@@ -105,8 +105,10 @@
     ] },
     { title: 'Ses', items: [
       { key: 'muted', type: 'toggle', label: 'Sessiz' },
-      { key: 'instrument', type: 'select', label: 'Enstrüman', options: INSTRUMENTS },
-      { key: 'volume', type: 'range', label: 'Ses düzeyi', min: 0, max: 1, step: 0.05, fmt: fmtPct, live: false },
+      { key: 'instrument', type: 'select', label: 'Enstrüman', groups: instrumentGroups(), statusId: 'instrument-status' },
+      { key: 'volume', type: 'range', label: 'Ses düzeyi', min: 0, max: 1, step: 0.05, fmt: fmtPct },
+      { key: 'reverb', type: 'range', label: 'Yankı', min: 0, max: 0.8, step: 0.05, fmt: fmtPct, hint: 'Salon etkisi; 0 tamamen kuru ses.' },
+      { key: 'velocity', type: 'toggle', label: 'Çarpma hızı ses şiddetini etkilesin', hint: 'Hızlı düşen top daha güçlü basar.' },
       { key: 'duration', type: 'range', label: 'Nota süresi', min: 0.25, max: 4, step: 0.25, fmt: fmtSec },
       { key: 'scale', type: 'select', label: 'Dizi', options: Object.keys(SCALES).map(function (k) { return [k, SCALES[k].label]; }) },
       { key: 'root', type: 'select', label: 'Tonik', options: NOTE_NAMES.map(function (n, i) { return [i, prettyNote(n)]; }) },
@@ -143,8 +145,6 @@
 
   var pointer = { x: -1, y: -1, inside: false, dragging: null };
 
-  var instrument = null;
-
   // ------------------------------------------------------------- Settings
 
   function loadSettings() {
@@ -156,6 +156,7 @@
       });
     } catch (e) { /* storage unavailable: use defaults */ }
     if (!SCALES[s.scale]) s.scale = DEFAULTS.scale;
+    if (!SoundEngine.has(s.instrument)) s.instrument = DEFAULTS.instrument;
     return s;
   }
 
@@ -172,8 +173,9 @@
 
   function applySetting(key) {
     switch (key) {
-      case 'instrument': instrument = Synth.createInstrument(S.instrument); break;
-      case 'volume': Synth.setVolume(S.volume); break;
+      case 'instrument': SoundEngine.setInstrument(S.instrument); break;
+      case 'volume': SoundEngine.setVolume(S.volume); break;
+      case 'reverb': SoundEngine.setReverb(S.reverb); break;
       case 'scale': case 'root': case 'baseOctave': case 'octaves': buildKeys(); break;
       case 'maxBalls': if (balls.length > S.maxBalls) balls.splice(0, balls.length - S.maxBalls); break;
       case 'ballScale': balls.forEach(function (b) { b.r = SIZES[b.size].r * S.ballScale; }); break;
@@ -209,7 +211,17 @@
     return Math.max(0, Math.min(keys.length - 1, i));
   }
 
-  function playKeyAt(x, color) {
+  function instrumentGroups() {
+    var groups = [];
+    SoundEngine.instruments.forEach(function (inst) {
+      var g = groups[groups.length - 1];
+      if (!g || g.label !== inst.group) groups.push(g = { label: inst.group, options: [] });
+      g.options.push([inst.id, inst.label]);
+    });
+    return groups;
+  }
+
+  function playKeyAt(x, color, impact) {
     var key = keys[keyIndexAt(x)];
     key.flash = 1;
     key.color = color;
@@ -219,7 +231,10 @@
       labels.push({ x: x, y: floorY - 14, text: prettyNote(key.name) + key.octave, color: color, life: 1 });
     }
     if (!S.muted && started) {
-      try { instrument.play(key.name, key.octave, S.duration); } catch (e) { /* never let audio break the loop */ }
+      var velocity = S.velocity ? 0.3 + 0.7 * Math.min(1, impact / S.maxSpeed) : 0.8;
+      try {
+        SoundEngine.play(key.name, key.octave, { velocity: velocity, duration: S.duration });
+      } catch (e) { /* never let audio break the loop */ }
     }
   }
 
@@ -276,7 +291,7 @@
       b.y = Math.max(b.r, 2 * (floorY - b.r) - b.y);   // mirror the overshoot to conserve energy
       b.vy = -Math.abs(b.vy) * e;
       if (impact > MIN_IMPACT && b.cooldown <= 0) {
-        playKeyAt(b.x, b.color);
+        playKeyAt(b.x, b.color, impact);
         b.cooldown = 4;
       }
       if (Math.abs(b.vy) < 0.3) { b.vy = 0; b.y = floorY - b.r; }  // came to rest
@@ -564,15 +579,33 @@
       h.appendChild(sl);
       var sel = document.createElement('select');
       sel.id = id;
-      item.options.forEach(function (o) {
-        var opt = document.createElement('option');
-        opt.value = o[0];
-        opt.textContent = o[1];
-        sel.appendChild(opt);
-      });
+      var addOptions = function (parent, options) {
+        options.forEach(function (o) {
+          var opt = document.createElement('option');
+          opt.value = o[0];
+          opt.textContent = o[1];
+          parent.appendChild(opt);
+        });
+      };
+      if (item.groups) {
+        item.groups.forEach(function (g) {
+          var og = document.createElement('optgroup');
+          og.label = g.label;
+          addOptions(og, g.options);
+          sel.appendChild(og);
+        });
+      } else {
+        addOptions(sel, item.options);
+      }
       sel.value = S[item.key];
       sel.addEventListener('change', function () { setSetting(item.key, sel.value); });
       wrap.append(h, sel);
+      if (item.statusId) {
+        var status = el('p', 'control-hint control-status');
+        status.id = item.statusId;
+        wrap.appendChild(status);
+        SoundEngine.onStatus(renderSoundStatus);
+      }
     } else if (item.type === 'buttons') {
       var row = el('div', 'button-row');
       item.buttons.forEach(function (bd) {
@@ -593,6 +626,13 @@
     clearBalls: function () { balls = []; spawnClock = 0; },
     clearBarriers: function () { barriers = []; autoBarriersAdded = 0; barrierClock = 0; }
   };
+
+  function renderSoundStatus(st) {
+    var node = document.getElementById('instrument-status');
+    if (!node) return;
+    node.textContent = st.text;
+    node.dataset.status = st.status;
+  }
 
   function renderStats() {
     document.getElementById('stats').textContent =
@@ -624,6 +664,7 @@
   function bindUI() {
     document.getElementById('btn-start').addEventListener('click', function () {
       started = true;
+      SoundEngine.unlock();
       document.getElementById('start-overlay').hidden = true;
       setRunning(true);
     });
@@ -729,8 +770,10 @@
 
   // ---------------------------------------------------------------- Init
 
-  instrument = Synth.createInstrument(S.instrument);
-  Synth.setVolume(S.volume);
+  SoundEngine.init();
+  SoundEngine.setInstrument(S.instrument);
+  SoundEngine.setVolume(S.volume);
+  SoundEngine.setReverb(S.reverb);
   buildKeys();
   buildPanel();
   bindUI();
