@@ -50,7 +50,7 @@ var Synth, AudioSynth, AudioSynthInstrument;
 		return this._volume;
 	});
 	setPub('getVolume', function() { return Math.round(this._volume/32768*10000)/10000; });
-	setPriv('_notes',{'C':261.63,'C#':277.18,'D':293.66,'D#':311.13,'E':329.63,'F':346.23,'F#':369.99,'G':392.00,'G#':415.30,'A':440.00,'A#':466.16,'B':493.88});
+	setPriv('_notes',{'C':261.63,'C#':277.18,'D':293.66,'D#':311.13,'E':329.63,'F':349.23,'F#':369.99,'G':392.00,'G#':415.30,'A':440.00,'A#':466.16,'B':493.88});
 	setPriv('_fileCache',[],true);
 	setPriv('_temp',{},true);
 	setPriv('_sounds',[],true);
@@ -158,7 +158,9 @@ var Synth, AudioSynth, AudioSynthInstrument;
 	setPub('play', function(sound, note, octave, duration) {
 		var src = this.generate(sound, note, octave, duration);
 		var audio = new Audio(src);
-		audio.play();
+		var playing = audio.play();
+		// Browsers reject play() before the first user gesture; don't leak unhandled rejections.
+		if(playing && typeof playing.catch === 'function') { playing.catch(function() {}); }
 		return true;
 	});
 	setPub('debug', function() { this._debug = true; });
@@ -198,7 +200,7 @@ var Synth, AudioSynth, AudioSynthInstrument;
 	});
 	setPub('loadSoundProfile', function() {
 		for(var i=0,len=arguments.length;i<len;i++) {
-			o = arguments[i];
+			var o = arguments[i];
 			if(!(o instanceof Object)) { throw new Error('Invalid sound profile.'); }
 			this._sounds.push(o);
 		}
@@ -207,7 +209,7 @@ var Synth, AudioSynth, AudioSynthInstrument;
 	});
 	setPub('loadModulationFunction', function() {
 		for(var i=0,len=arguments.length;i<len;i++) {
-			f = arguments[i];
+			var f = arguments[i];
 			if(typeof(f)!='function') { throw new Error('Invalid modulation function.'); }
 			this._mod.push(f);
 		}
