@@ -1,11 +1,13 @@
 /*
  * Public-domain melodies in a compact text notation.
  *
- *   E4      note + octave, a quarter note by default
- *   D#5s    sharps with #, flats with b (Bb3)
- *   C4h.    duration letter: w=4, h=2, q=1, e=1/2, s=1/4 beats; a trailing "." makes it dotted
- *   -e      rest (here an eighth)
- *   |       bar line, ignored
+ *   E4         note + octave, a quarter note by default
+ *   D#5s       sharps with #, flats with b (Bb3)
+ *   C4h.       duration letter: w=4, h=2, q=1, e=1/2, s=1/4, t=1/8 beats; a trailing "." makes it dotted
+ *   -e         rest (here an eighth)
+ *   [C4 E4 G4]h  chord: notes sounding together, one duration for all
+ *   bpm=72     tempo (quarter notes per minute), usually first
+ *   |          bar line, ignored
  */
 var Songs = (function () {
   'use strict';
@@ -45,37 +47,59 @@ var Songs = (function () {
   ];
 
   var SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
-  var DUR = { w: 4, h: 2, q: 1, e: 0.5, s: 0.25 };
-  var NOTE_RE = /^([A-Ga-g])([#b]?)(\d)([whqes]?)(\.?)$/;
-  var REST_RE = /^-([whqes]?)(\.?)$/;
+  var DUR = { w: 4, h: 2, q: 1, e: 0.5, s: 0.25, t: 0.125 };
+  var NOTE_RE = /^([A-Ga-g])([#b]?)(\d)([whqest]?)(\.?)$/;
+  var PITCH_RE = /^([A-Ga-g])([#b]?)(\d)$/;
+  var REST_RE = /^-([whqest]?)(\.?)$/;
+  var CHORD_RE = /^\[([^\]]*)\]([whqest]?)(\.?)$/;
+  var BPM_RE = /^bpm=(\d+(?:\.\d+)?)$/i;
+  // A chord (brackets may contain spaces), or any other run of non-space characters.
+  var TOKEN_RE = /\[[^\]]*\][whqest]?\.?|\[[^\]]*$|[^\s|\[\]]+/g;
+
+  function midiOf(m) {
+    var semi = SEMI[m[1].toUpperCase()] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+    return 12 * (Number(m[3]) + 1) + semi;
+  }
 
   function beatsOf(letter, dot) {
     var b = DUR[letter || 'q'];
     return dot ? b * 1.5 : b;
   }
 
-  // Returns { notes: [{ midi|null, beats, beat }], totalBeats, errors: [token...] }
+  // Returns { notes: [{ midi|null, beats, beat }], totalBeats, errors: [token...], bpm|null }.
+  // Notes of a chord share the same `beat`.
   function parse(text) {
-    var notes = [], errors = [], beat = 0;
-    (text || '').split(/[\s|]+/).forEach(function (tok) {
-      if (!tok) return;
-      var m = NOTE_RE.exec(tok), beats;
-      if (m) {
-        var semi = SEMI[m[1].toUpperCase()] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
-        var midi = 12 * (Number(m[3]) + 1) + semi;
+    var notes = [], errors = [], beat = 0, bpm = null;
+    ((text || '').match(TOKEN_RE) || []).forEach(function (tok) {
+      var m, beats, midi;
+      if ((m = BPM_RE.exec(tok))) {
+        var v = Number(m[1]);
+        if (v >= 20 && v <= 300) bpm = v; else errors.push(tok);
+      } else if ((m = CHORD_RE.exec(tok))) {
+        beats = beatsOf(m[2], m[3]);
+        var inner = m[1].split(/\s+/).filter(Boolean);
+        if (!inner.length) { errors.push(tok); return; }
+        inner.forEach(function (p) {
+          var pm = PITCH_RE.exec(p);
+          if (!pm || (midi = midiOf(pm)) < 21 || midi > 108) { errors.push(p); return; }
+          notes.push({ midi: midi, beats: beats, beat: beat });
+        });
+        beat += beats;                      // keep the timing even if a chord note was wrong
+      } else if ((m = NOTE_RE.exec(tok))) {
         beats = beatsOf(m[4], m[5]);
+        midi = midiOf(m);
         if (midi < 21 || midi > 108) { errors.push(tok); return; }
         notes.push({ midi: midi, beats: beats, beat: beat });
+        beat += beats;
       } else if ((m = REST_RE.exec(tok))) {
         beats = beatsOf(m[1], m[2]);
         notes.push({ midi: null, beats: beats, beat: beat });
+        beat += beats;
       } else {
         errors.push(tok);
-        return;
       }
-      beat += beats;
     });
-    return { notes: notes, totalBeats: beat, errors: errors };
+    return { notes: notes, totalBeats: beat, errors: errors, bpm: bpm };
   }
 
   function byId(id) {
@@ -93,7 +117,7 @@ var Songs = (function () {
       var p = parse(s.notes === null ? customText : s.notes);
       p.id = s.id;
       p.title = s.title;
-      p.bpm = s.bpm;
+      p.bpm = p.bpm || s.bpm;   // a "bpm=" in the text wins
       return p;
     },
     groups: function () {

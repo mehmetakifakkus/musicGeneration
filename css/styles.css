@@ -324,3 +324,6 @@ textarea {
 textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .control[hidden] { display: none; }
 .control-status[data-status="ok"] { color: var(--muted); }
+
+.midi-options { display: grid; gap: 10px; margin-top: 10px; }
+.midi-options[hidden] { display: none; }

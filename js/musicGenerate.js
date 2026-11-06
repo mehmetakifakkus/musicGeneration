@@ -105,7 +105,8 @@
       { key: 'mode', type: 'select', label: 'Mod', options: MODES, statusId: 'mode-status' },
       { key: 'song', type: 'select', label: 'Şarkı', groups: Songs.groups(), visible: songMode },
       { key: 'customSong', type: 'textarea', label: 'Kendi melodin', visible: function () { return songMode() && S.song === 'custom'; },
-        hint: 'Nota+oktav, ardından süre: w=4, h=2, q=1 (varsayılan), e=½, s=¼ vuruş; "." noktalı, "-" sus, "#" diyez, "b" bemol. Örn: E4 D#4e C4h. -q' },
+        hint: 'Nota+oktav, ardından süre: w=4, h=2, q=1 (varsayılan), e=½, s=¼, t=⅛ vuruş; "." noktalı, "-" sus, "#" diyez, "b" bemol, [C4 E4 G4]h akor, başta bpm=72 tempo. Örn: bpm=90 E4 D#4e [C4 E4]h. -q' },
+      { type: 'midi', label: 'MIDI dosyasından', visible: songMode },
       { key: 'tempo', type: 'range', label: 'Tempo', min: 0.5, max: 1.5, step: 0.05, fmt: fmtTimes, visible: function () { return S.mode === 'choreo'; } },
       { key: 'loop', type: 'toggle', label: 'Şarkı bitince başa dön', visible: songMode },
       { type: 'buttons', buttons: [{ label: 'Şarkıyı baştan başlat', action: 'restartSong' }], visible: songMode }
@@ -391,7 +392,13 @@
     }
     if (S.mode === 'sequence' && song) {
       var n = nextSequenceNote();
-      if (n) playKey(keyIndexOfMidi(n.midi), b.x, b.color, impact);
+      if (!n) return;
+      playKey(keyIndexOfMidi(n.midi), b.x, b.color, impact);
+      // The rest of a chord sounds on the same hit.
+      while (songNext < song.notes.length && song.notes[songNext].beat === n.beat) {
+        var c = song.notes[songNext++];
+        if (c.midi !== null) playKey(keyIndexOfMidi(c.midi), b.x, b.color, impact);
+      }
       return;
     }
     playKey(keyIndexAt(b.x), b.x, b.color, impact);
@@ -1082,6 +1089,8 @@
       ta.value = S[item.key];
       ta.addEventListener('change', function () { setSetting(item.key, ta.value); });
       wrap.append(th, ta);
+    } else if (item.type === 'midi') {
+      buildMidiControl(wrap, item);
     } else if (item.type === 'buttons') {
       var row = el('div', 'button-row');
       item.buttons.forEach(function (bd) {
@@ -1096,6 +1105,87 @@
     if (item.hint) wrap.appendChild(el('p', 'control-hint', item.hint));
     if (item.visible) visibilityRules.push({ node: wrap, test: item.visible });
     return wrap;
+  }
+
+  // ----------------------------------------------------------- MIDI import
+
+  var midiFile = null;     // { name, data } of the last imported file (not saved)
+
+  function buildMidiControl(wrap, item) {
+    var head = el('div', 'control-head');
+    head.appendChild(el('label', null, item.label));
+    var input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.mid,.midi,audio/midi,audio/x-midi';
+    input.hidden = true;
+    var pick = el('button', 'btn block', 'MIDI dosyası seç…');
+    pick.type = 'button';
+    pick.addEventListener('click', function () { input.click(); });
+
+    var opts = el('div', 'midi-options');
+    var trackSel = document.createElement('select');
+    trackSel.id = 'ctl-midiTrack';
+    var topLab = el('label', 'toggle');
+    var topBox = document.createElement('input');
+    topBox.type = 'checkbox';
+    topBox.checked = true;
+    topBox.id = 'ctl-midiTop';
+    topLab.append(el('span', null, 'Yalnızca en üst ses (melodi)'), topBox, el('span', 'switch'));
+    opts.append(trackSel, topLab);
+    opts.hidden = true;
+
+    var status = el('p', 'control-hint control-status');
+    status.id = 'midi-status';
+    status.textContent = 'Dosya notaya çevrilip "Kendi melodin" kutusuna yazılır; orada düzenleyebilirsin. Davul kanalı atlanır.';
+
+    function apply() {
+      if (!midiFile) return;
+      var track = trackSel.value === 'all' ? 'all' : Number(trackSel.value);
+      var r = MidiImport.toNotation(midiFile.data, { track: track, topOnly: topBox.checked });
+      if (!r.notes) { status.textContent = 'Bu seçimde çalınabilir nota yok.'; status.dataset.status = 'error'; return; }
+      var ta = document.getElementById('ctl-customSong');
+      if (ta) ta.value = r.text;
+      var songSel = document.getElementById('ctl-song');
+      if (songSel) songSel.value = 'custom';
+      S.song = 'custom';
+      setSetting('customSong', r.text);
+      status.dataset.status = 'ok';
+      status.textContent = midiFile.name + ': ' + r.notes + ' nota, ' + r.bpm + ' bpm' +
+        (r.truncated ? ' (çok uzun; ilk ' + r.groups + ' vuruş alındı)' : '') +
+        (r.dropped ? ', piyano aralığı dışındaki ' + r.dropped + ' nota atlandı' : '') + '.';
+    }
+
+    input.addEventListener('change', function () {
+      var file = input.files && input.files[0];
+      input.value = '';
+      if (!file) return;
+      file.arrayBuffer().then(function (buf) {
+        var data = MidiImport.parse(buf);
+        var tracks = MidiImport.playableTracks(data);
+        if (!tracks.length) throw new Error('Dosyada çalınabilir nota yok.');
+        midiFile = { name: file.name, data: data };
+        trackSel.textContent = '';
+        var total = tracks.reduce(function (n, t) { return n + t.count; }, 0);
+        var all = document.createElement('option');
+        all.value = 'all';
+        all.textContent = 'Tüm izler (' + total + ' nota)';
+        trackSel.appendChild(all);
+        tracks.forEach(function (t) {
+          var o = document.createElement('option');
+          o.value = t.index;
+          o.textContent = (t.name || 'İz ' + (t.index + 1)) + ' (' + t.count + ' nota)';
+          trackSel.appendChild(o);
+        });
+        opts.hidden = false;
+        apply();
+      }).catch(function (err) {
+        status.dataset.status = 'error';
+        status.textContent = 'Okunamadı: ' + (err && err.message ? err.message : err);
+      });
+    });
+    trackSel.addEventListener('change', apply);
+    topBox.addEventListener('change', apply);
+    wrap.append(head, pick, input, opts, status);
   }
 
   var visibilityRules = [];
