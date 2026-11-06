@@ -35,7 +35,15 @@
   var CANVAS_BG = '#0a0d13';
   var STORAGE_KEY = 'musicgen.settings.v1';
 
+  var MODES = [['free', 'Serbest'], ['sequence', 'Sıradaki nota'], ['choreo', 'Koreografi']];
+
   var DEFAULTS = {
+    mode: 'free',
+    song: 'ode',
+    tempo: 1,
+    loop: true,
+    customSong: 'C4 E4 G4 C5h | G4 E4 C4h | D4 F4 A4 D5h | B4h. -q | C5w',
+
     collisions: true,
     gravity: 0.35,
     sizeGravity: true,
@@ -82,6 +90,15 @@
   // ------------------------------------------------------- Settings schema
 
   var SCHEMA = [
+    { title: 'Mod ve melodi', items: [
+      { key: 'mode', type: 'select', label: 'Mod', options: MODES, statusId: 'mode-status' },
+      { key: 'song', type: 'select', label: 'Şarkı', groups: Songs.groups(), visible: songMode },
+      { key: 'customSong', type: 'textarea', label: 'Kendi melodin', visible: function () { return songMode() && S.song === 'custom'; },
+        hint: 'Nota+oktav, ardından süre: w=4, h=2, q=1 (varsayılan), e=½, s=¼ vuruş; "." noktalı, "-" sus, "#" diyez, "b" bemol. Örn: E4 D#4e C4h. -q' },
+      { key: 'tempo', type: 'range', label: 'Tempo', min: 0.5, max: 1.5, step: 0.05, fmt: fmtTimes, visible: function () { return S.mode === 'choreo'; } },
+      { key: 'loop', type: 'toggle', label: 'Şarkı bitince başa dön', visible: songMode },
+      { type: 'buttons', buttons: [{ label: 'Şarkıyı baştan başlat', action: 'restartSong' }], visible: songMode }
+    ] },
     { title: 'Fizik', items: [
       { key: 'collisions', type: 'toggle', label: 'Toplar birbirine çarpsın' },
       { key: 'gravity', type: 'range', label: 'Yerçekimi', min: 0, max: 1.5, step: 0.05, fmt: fmtFixed(2) },
@@ -122,6 +139,8 @@
     ] }
   ];
 
+  function songMode() { return S.mode !== 'free'; }
+
   // ------------------------------------------------------------------ State
 
   var S = loadSettings();
@@ -143,6 +162,13 @@
   var barrierClock = 0;
   var autoBarriersAdded = 0;
 
+  // Melody modes
+  var song = null;         // parsed song: { title, bpm, notes: [{ midi|null, beats, beat }], totalBeats }
+  var songNext = 0;        // next note index to play (sequence) or to launch (choreography)
+  var songBeat = 0;        // choreography playhead, in beats
+  var songOffset = 0;      // beats added for each loop of the song
+  var songDone = false;
+
   var pointer = { x: -1, y: -1, inside: false, dragging: null };
 
   // ------------------------------------------------------------- Settings
@@ -157,6 +183,8 @@
     } catch (e) { /* storage unavailable: use defaults */ }
     if (!SCALES[s.scale]) s.scale = DEFAULTS.scale;
     if (!SoundEngine.has(s.instrument)) s.instrument = DEFAULTS.instrument;
+    if (!MODES.some(function (m) { return m[0] === s.mode; })) s.mode = DEFAULTS.mode;
+    if (!Songs.has(s.song)) s.song = DEFAULTS.song;
     return s;
   }
 
@@ -169,6 +197,7 @@
     S[key] = value;
     saveSettings();
     applySetting(key);
+    updateVisibility();
   }
 
   function applySetting(key) {
@@ -177,7 +206,8 @@
       case 'volume': SoundEngine.setVolume(S.volume); break;
       case 'reverb': SoundEngine.setReverb(S.reverb); break;
       case 'scale': case 'root': case 'baseOctave': case 'octaves': buildKeys(); break;
-      case 'maxBalls': if (balls.length > S.maxBalls) balls.splice(0, balls.length - S.maxBalls); break;
+      case 'mode': case 'song': case 'customSong': loadSong(key === 'mode'); break;
+      case 'maxBalls': trimFreeBalls(); break;
       case 'ballScale': balls.forEach(function (b) { b.r = SIZES[b.size].r * S.ballScale; }); break;
       case 'clickMode': syncClickMode(); break;
     }
@@ -187,24 +217,34 @@
 
   function prettyNote(name) { return name.replace('#', '♯'); }
 
+  function makeKey(midi, isRoot) {
+    var name = NOTE_NAMES[midi % 12];
+    return { name: name, octave: Math.floor(midi / 12) - 1, midi: midi, sharp: name.length > 1, isRoot: isRoot, flash: 0, color: '#fff' };
+  }
+
   function buildKeys() {
-    var steps = SCALES[S.scale].steps;
     keys = [];
+    if (S.mode !== 'free' && song && song.range) {
+      // Melody modes: a chromatic keyboard covering exactly the song's range.
+      for (var m = song.range[0]; m <= song.range[1]; m++) keys.push(makeKey(m, m % 12 === 0));
+      return;
+    }
+    var steps = SCALES[S.scale].steps;
     for (var o = 0; o < S.octaves; o++) {
       for (var i = 0; i < steps.length; i++) {
         var semi = S.root + steps[i];
-        var name = NOTE_NAMES[semi % 12];
-        keys.push({
-          name: name,
-          octave: Math.min(8, S.baseOctave + o + Math.floor(semi / 12)),
-          sharp: name.length > 1,
-          isRoot: i === 0,
-          flash: 0,
-          color: '#fff'
-        });
+        var midi = Math.min(108, 12 * (S.baseOctave + o + 1) + semi);
+        keys.push(makeKey(midi, i === 0));
       }
     }
   }
+
+  function keyIndexOfMidi(midi) {
+    for (var i = 0; i < keys.length; i++) if (keys[i].midi === midi) return i;
+    return -1;
+  }
+
+  function keyCenter(i) { return (i + 0.5) * W / keys.length; }
 
   function keyIndexAt(x) {
     var i = Math.floor(x / (W / keys.length));
@@ -221,8 +261,9 @@
     return groups;
   }
 
-  function playKeyAt(x, color, impact) {
-    var key = keys[keyIndexAt(x)];
+  function playKey(index, x, color, impact, duration) {
+    var key = keys[index];
+    if (!key) return;
     key.flash = 1;
     key.color = color;
     notesPlayed++;
@@ -233,7 +274,7 @@
     if (!S.muted && started) {
       var velocity = S.velocity ? 0.3 + 0.7 * Math.min(1, impact / S.maxSpeed) : 0.8;
       try {
-        SoundEngine.play(key.name, key.octave, { velocity: velocity, duration: S.duration });
+        SoundEngine.play(key.name, key.octave, { velocity: velocity, duration: duration || S.duration });
       } catch (e) { /* never let audio break the loop */ }
     }
   }
@@ -262,16 +303,164 @@
       cooldown: 0
     });
     ballId++;
-    if (balls.length > S.maxBalls) balls.shift();
+    trimFreeBalls();
+  }
+
+  function freeBallCount() {
+    var n = 0;
+    for (var i = 0; i < balls.length; i++) if (!balls[i].scripted) n++;
+    return n;
+  }
+
+  function trimFreeBalls() {
+    var extra = freeBallCount() - S.maxBalls;
+    for (var i = 0; i < balls.length && extra > 0; ) {
+      if (!balls[i].scripted) { balls.splice(i, 1); extra--; } else i++;
+    }
+  }
+
+  function onFloorHit(b, impact) {
+    if (b.scripted) {
+      if (!b.spent) {
+        b.spent = true;
+        playKey(keyIndexOfMidi(b.midi), b.x, b.color, impact, b.noteDuration);
+      }
+      return;
+    }
+    if (S.mode === 'sequence' && song) {
+      var n = nextSequenceNote();
+      if (n) playKey(keyIndexOfMidi(n.midi), b.x, b.color, impact);
+      return;
+    }
+    playKey(keyIndexAt(b.x), b.x, b.color, impact);
+  }
+
+  // --------------------------------------------------------------- Songs
+
+  function loadSong(modeChanged) {
+    song = Songs.load(S.song, S.customSong);
+    var lo = Infinity, hi = -Infinity;
+    song.notes.forEach(function (n) {
+      if (n.midi === null) return;
+      lo = Math.min(lo, n.midi);
+      hi = Math.max(hi, n.midi);
+    });
+    if (lo <= hi) {
+      while (hi - lo + 1 < 13) {      // at least an octave of keys so they don't get huge
+        if (lo > 21) lo--;
+        if (hi - lo + 1 < 13 && hi < 108) hi++;
+      }
+      song.range = [lo, hi];
+    }
+    buildKeys();
+    if (modeChanged) {
+      // Choreography owns the stage; free balls would only get in the way.
+      if (S.mode === 'choreo') balls = [];
+      else balls = balls.filter(function (b) { return !b.scripted; });
+    }
+    restartSong();
+    renderModeStatus();
+  }
+
+  function restartSong() {
+    songNext = 0;
+    songOffset = 0;
+    songDone = false;
+    // Start early enough that the first ball can fall the whole way.
+    songBeat = song && song.notes.length ? -dropPlan().frames / framesPerBeat() - 0.25 : 0;
+    balls = balls.filter(function (b) { return !b.scripted; });
+  }
+
+  function playableNotes() {
+    return song ? song.notes.filter(function (n) { return n.midi !== null; }).length : 0;
+  }
+
+  function nextSequenceNote() {
+    if (!song || songDone) return null;
+    for (var tries = 0; tries <= song.notes.length; tries++) {
+      if (songNext >= song.notes.length) {
+        if (!S.loop) { songDone = true; return null; }
+        songNext = 0;
+      }
+      var n = song.notes[songNext++];
+      if (n.midi !== null) return n;
+    }
+    return null;
+  }
+
+  function framesPerBeat() { return 3600 / (song.bpm * S.tempo); }
+
+  // How choreographed balls fall. Every ball takes the same time to land, so
+  // notes are launched in order; smaller balls simply start a little lower.
+  function dropPlan() {
+    var rMax = SIZES[SIZES.length - 1].r * S.ballScale;
+    var dist = Math.max(40, floorY - 2 * rMax - 2);
+    var g = S.gravity;
+    if (g >= 0.02) return { g: g, vy0: 0, dist: dist, frames: Math.sqrt(2 * dist / g) };
+    return { g: 0, vy0: 6, dist: dist, frames: dist / 6 };   // no gravity: constant fall
+  }
+
+  function updateChoreo(dt) {
+    if (!song || songDone || !song.notes.length) return;
+    var fpb = framesPerBeat();
+    songBeat += dt / fpb;
+
+    while (true) {
+      if (songNext >= song.notes.length) {
+        if (!S.loop) { songDone = true; return; }
+        songOffset += song.totalBeats + 2;    // two beats of silence between loops
+        songNext = 0;
+      }
+      var n = song.notes[songNext];
+      if (n.midi === null) { songNext++; continue; }
+
+      var plan = dropPlan();
+      var launchBeat = songOffset + n.beat - plan.frames / fpb;
+      if (songBeat < launchBeat) return;
+      launchBall(n, plan, (songBeat - launchBeat) * fpb, fpb);
+      songNext++;
+    }
+  }
+
+  function launchBall(note, plan, late, fpb) {
+    var idx = keyIndexOfMidi(note.midi);
+    if (idx < 0) return;
+    var size = Math.floor(Math.random() * SIZES.length);
+    var r = SIZES[size].r * S.ballScale;
+    var y0 = floorY - r - plan.dist;
+    var tx = keyCenter(idx);
+    var spread = W * 0.25;
+    var x0 = clamp(tx + (Math.random() - 0.5) * 2 * spread, r, W - r);
+    var vx = (tx - x0) / plan.frames;
+    var t = Math.min(late, plan.frames - 1);   // catch up if we launched a little late
+    balls.push({
+      id: ballId,
+      size: size,
+      r: r,
+      g: plan.g,
+      x: x0 + vx * t,
+      y: y0 + plan.vy0 * t + 0.5 * plan.g * t * t,
+      vx: vx,
+      vy: plan.vy0 + plan.g * t,
+      px: x0,
+      color: 'hsl(' + ((ballId * 137.508) % 360).toFixed(1) + ', 80%, 62%)',
+      cooldown: 0,
+      scripted: true,
+      midi: note.midi,
+      noteDuration: clamp(note.beats * fpb / 60 * 1.6, 0.35, 3),
+      spent: false,
+      alpha: 1
+    });
+    ballId++;
   }
 
   function stepBall(b, h, g) {
     var e = S.restitution;
     b.px = b.x;
-    b.vy += g * (S.sizeGravity ? SIZES[b.size].g : 1) * h;
+    b.vy += (b.scripted ? b.g : g * (S.sizeGravity ? SIZES[b.size].g : 1)) * h;
 
     var speed = Math.hypot(b.vx, b.vy);
-    if (speed > S.maxSpeed) {           // clamp the magnitude, in every direction
+    if (!b.scripted && speed > S.maxSpeed) {           // clamp the magnitude, in every direction
       b.vx *= S.maxSpeed / speed;
       b.vy *= S.maxSpeed / speed;
     }
@@ -291,13 +480,16 @@
       b.y = Math.max(b.r, 2 * (floorY - b.r) - b.y);   // mirror the overshoot to conserve energy
       b.vy = -Math.abs(b.vy) * e;
       if (impact > MIN_IMPACT && b.cooldown <= 0) {
-        playKeyAt(b.x, b.color, impact);
+        onFloorHit(b, impact);
         b.cooldown = 4;
       }
       if (Math.abs(b.vy) < 0.3) { b.vy = 0; b.y = floorY - b.r; }  // came to rest
     }
 
+    if (b.spent) b.alpha -= 0.025 * h;   // a choreographed ball fades out after its note
+
     // Barriers: resolve once per ball, on the side the ball came from.
+    if (b.scripted || S.mode === 'choreo') return;
     for (var i = 0; i < barriers.length; i++) {
       var bx = barriers[i].fx * W;
       if (Math.abs(b.x - bx) < b.r) {
@@ -358,14 +550,16 @@
   function update(dt) {
     var seconds = dt / 60;
 
-    if (S.autoSpawn && balls.length < S.maxBalls) {
+    if (S.mode === 'choreo') updateChoreo(dt);
+
+    if (S.autoSpawn && S.mode !== 'choreo' && freeBallCount() < S.maxBalls) {
       spawnClock += seconds;
       if (spawnClock >= S.spawnInterval) { spawnClock = 0; spawnBall(); }
     } else {
       spawnClock = 0;
     }
 
-    if (S.autoBarriers && autoBarriersAdded < S.maxBarriers) {
+    if (S.autoBarriers && S.mode !== 'choreo' && autoBarriersAdded < S.maxBarriers) {
       barrierClock += seconds;
       if (barrierClock >= S.barrierInterval) {
         barrierClock = 0;
@@ -383,10 +577,12 @@
       for (var i = 0; i < balls.length; i++) stepBall(balls[i], h, S.gravity);
       if (S.collisions) {
         for (var a = 0; a < balls.length; a++) {
-          for (var b = a + 1; b < balls.length; b++) collide(balls[a], balls[b]);
+          if (balls[a].scripted) continue;    // choreographed balls must not be knocked off course
+          for (var b = a + 1; b < balls.length; b++) if (!balls[b].scripted) collide(balls[a], balls[b]);
         }
       }
     }
+    balls = balls.filter(function (b) { return !b.scripted || b.alpha > 0; });
   }
 
   var lastTime = performance.now();
@@ -424,14 +620,15 @@
       }
     }
 
-    // Barriers
-    var hover = pointer.inside ? (pointer.dragging !== null ? pointer.dragging : barrierNear(pointer.x, BARRIER_GRAB_PX)) : -1;
-    for (i = 0; i < barriers.length; i++) {
+    // Barriers (inactive while choreographing)
+    var showBarriers = S.mode !== 'choreo';
+    var hover = showBarriers && pointer.inside ? (pointer.dragging !== null ? pointer.dragging : barrierNear(pointer.x, BARRIER_GRAB_PX)) : -1;
+    for (i = 0; showBarriers && i < barriers.length; i++) {
       var x = barriers[i].fx * W;
       ctx.fillStyle = i === hover ? '#ffffff' : 'rgba(230, 233, 239, 0.75)';
       ctx.fillRect(x - (i === hover ? 1.5 : 1), 0, i === hover ? 3 : 2, floorY);
     }
-    if (pointer.inside && hover < 0 && S.clickMode === 'barrier' && pointer.y < floorY) {
+    if (showBarriers && pointer.inside && hover < 0 && S.clickMode === 'barrier' && pointer.y < floorY) {
       ctx.save();
       ctx.setLineDash([4, 6]);
       ctx.strokeStyle = 'rgba(124, 156, 255, 0.55)';
@@ -445,6 +642,7 @@
     // Balls
     for (i = 0; i < balls.length; i++) {
       var b = balls[i];
+      ctx.globalAlpha = b.scripted ? Math.max(0, b.alpha) : 1;
       ctx.fillStyle = b.color;
       ctx.beginPath();
       ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
@@ -454,6 +652,7 @@
       ctx.arc(b.x - b.r * 0.35, b.y - b.r * 0.35, b.r * 0.3, 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
 
     // Floating note labels
     ctx.textAlign = 'center';
@@ -526,6 +725,7 @@
   // ------------------------------------------------------------------ UI
 
   function buildPanel() {
+    visibilityRules = [];
     var root = document.getElementById('controls');
     root.textContent = '';
     SCHEMA.forEach(function (section) {
@@ -534,6 +734,8 @@
       section.items.forEach(function (item) { sec.appendChild(buildControl(item)); });
       root.appendChild(sec);
     });
+    updateVisibility();
+    renderModeStatus();
   }
 
   function buildControl(item) {
@@ -604,8 +806,20 @@
         var status = el('p', 'control-hint control-status');
         status.id = item.statusId;
         wrap.appendChild(status);
-        SoundEngine.onStatus(renderSoundStatus);
+        if (item.key === 'instrument') SoundEngine.onStatus(renderSoundStatus);
       }
+    } else if (item.type === 'textarea') {
+      var th = el('div', 'control-head');
+      var tl = el('label', null, item.label);
+      tl.htmlFor = id;
+      th.appendChild(tl);
+      var ta = document.createElement('textarea');
+      ta.id = id;
+      ta.rows = 4;
+      ta.spellcheck = false;
+      ta.value = S[item.key];
+      ta.addEventListener('change', function () { setSetting(item.key, ta.value); });
+      wrap.append(th, ta);
     } else if (item.type === 'buttons') {
       var row = el('div', 'button-row');
       item.buttons.forEach(function (bd) {
@@ -618,14 +832,39 @@
     }
 
     if (item.hint) wrap.appendChild(el('p', 'control-hint', item.hint));
+    if (item.visible) visibilityRules.push({ node: wrap, test: item.visible });
     return wrap;
+  }
+
+  var visibilityRules = [];
+  function updateVisibility() {
+    visibilityRules.forEach(function (r) { r.node.hidden = !r.test(); });
   }
 
   var ACTIONS = {
     addBall: function () { spawnBall(); },
     clearBalls: function () { balls = []; spawnClock = 0; },
-    clearBarriers: function () { barriers = []; autoBarriersAdded = 0; barrierClock = 0; }
+    clearBarriers: function () { barriers = []; autoBarriersAdded = 0; barrierClock = 0; },
+    restartSong: function () { restartSong(); renderModeStatus(); }
   };
+
+  var MODE_HINTS = {
+    free: 'Toplar rastgele zıplar; hangi tuşa düşerse o çalar.',
+    sequence: 'Her çarpma şarkının sıradaki notasını çalar; ritim toplardan gelir.',
+    choreo: 'Her nota için bir top atılır ve tam zamanında doğru tuşa düşer. Engeller bu modda devre dışı.'
+  };
+
+  function renderModeStatus() {
+    var node = document.getElementById('mode-status');
+    if (!node) return;
+    var text = MODE_HINTS[S.mode];
+    if (songMode() && song) {
+      if (song.errors.length) text += ' Anlaşılamayan: ' + song.errors.slice(0, 5).join(', ');
+      else if (!playableNotes()) text += ' Şarkıda nota yok.';
+    }
+    node.textContent = text;
+    node.dataset.status = songMode() && song && (song.errors.length || !playableNotes()) ? 'error' : 'ok';
+  }
 
   function renderSoundStatus(st) {
     var node = document.getElementById('instrument-status');
@@ -635,8 +874,14 @@
   }
 
   function renderStats() {
-    document.getElementById('stats').textContent =
-      balls.length + ' top · ' + barriers.length + ' engel · ' + notesPlayed + ' nota';
+    var text = balls.length + ' top · ';
+    if (S.mode !== 'choreo') text += barriers.length + ' engel · ';
+    text += notesPlayed + ' nota';
+    if (songMode() && song && playableNotes()) {
+      text += ' · ♪ ' + song.title.split(' — ')[0];
+      if (songDone) text += ' (bitti)';
+    }
+    document.getElementById('stats').textContent = text;
   }
 
   function setRunning(on) {
@@ -659,6 +904,7 @@
     barrierClock = 0;
     autoBarriersAdded = 0;
     keys.forEach(function (k) { k.flash = 0; });
+    restartSong();
   }
 
   function bindUI() {
@@ -714,7 +960,7 @@
 
     canvas.addEventListener('pointerdown', function (ev) {
       localPoint(ev);
-      var near = barrierNear(pointer.x, BARRIER_GRAB_PX);
+      var near = S.mode === 'choreo' ? -1 : barrierNear(pointer.x, BARRIER_GRAB_PX);
 
       if (ev.button === 2) {
         if (near >= 0) barriers.splice(near, 1);
@@ -726,6 +972,7 @@
         pointer.dragging = near;
         canvas.setPointerCapture(ev.pointerId);
       } else if (pointer.y < floorY) {
+        if (S.mode === 'choreo') return;   // the song drives the balls
         if (S.clickMode === 'barrier') addBarrier(pointer.x, false);
         else spawnBall(pointer.x, pointer.y, (Math.random() - 0.5) * 4, 0);
       }
@@ -748,7 +995,7 @@
       if (ev.code === 'Space') {
         ev.preventDefault();
         document.getElementById('btn-play').click();
-      } else if (ev.key === 'b' || ev.key === 'B') {
+      } else if ((ev.key === 'b' || ev.key === 'B') && S.mode !== 'choreo') {
         spawnBall();
       }
     });
@@ -774,11 +1021,11 @@
   SoundEngine.setInstrument(S.instrument);
   SoundEngine.setVolume(S.volume);
   SoundEngine.setReverb(S.reverb);
-  buildKeys();
+  resize();
+  loadSong(false);
   buildPanel();
   bindUI();
   syncClickMode();
-  resize();
   renderStats();
   requestAnimationFrame(frame);
 
@@ -789,6 +1036,8 @@
     get keys() { return keys; },
     get settings() { return S; },
     get notesPlayed() { return notesPlayed; },
+    get song() { return song; },
+    get songNext() { return songNext; },
     spawnBall: spawnBall,
     addBarrier: addBarrier,
     reset: reset

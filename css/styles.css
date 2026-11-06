@@ -310,3 +310,17 @@ select {
 
 .control-status[data-status="loading"] { color: var(--accent); }
 .control-status[data-status="error"] { color: #ff8a7a; }
+
+textarea {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  resize: vertical;
+}
+textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.control[hidden] { display: none; }
+.control-status[data-status="ok"] { color: var(--muted); }
