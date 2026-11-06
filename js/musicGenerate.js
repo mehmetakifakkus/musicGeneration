@@ -45,7 +45,8 @@
     customSong: 'C4 E4 G4 C5h | G4 E4 C4h | D4 F4 A4 D5h | B4h. -q | C5w',
 
     choreoReuse: 'max',
-    choreoMaxBalls: 0,
+    choreoTolerance: 0.1,
+    choreoTilt: 12,
     choreoMaxHop: 0.8,
     choreoMaxSpeed: 14,
     choreoSize: 'mixed',
@@ -91,7 +92,6 @@
 
   function fmtFixed(d) { return function (v) { return v.toFixed(d); }; }
   function fmtInt(v) { return String(Math.round(v)); }
-  function fmtLimit(v) { return v ? String(Math.round(v)) : 'Sınırsız'; }
   function fmtPct(v) { return Math.round(v * 100) + '%'; }
   function fmtTimes(v) { return trimZeros(v.toFixed(2)) + '×'; }
   function fmtSec(v) { return trimZeros(v.toFixed(2)) + ' sn'; }
@@ -111,12 +111,15 @@
     ] },
     { title: 'Koreografi', visible: function () { return S.mode === 'choreo'; }, items: [
       { key: 'choreoReuse', type: 'select', label: 'Top kullanımı', statusId: 'choreo-status', options: [
-        ['none', 'Her nota yeni top'], ['repeat', 'Tekrarlanan notalar aynı topla'], ['max', 'Mümkün olduğunca az top']] },
-      { key: 'choreoMaxBalls', type: 'range', label: 'Ekrandaki azami top', min: 0, max: 12, step: 1, fmt: fmtLimit,
-        hint: 'Sınıra gelince en uygun top yeniden kullanılır; gerekirse ekranın üstüne çıkıp zamanında geri döner.',
+        ['none', 'Her nota yeni top'], ['repeat', 'Yalnızca tekrarlanan notalar'], ['max', 'Fiziğin izin verdiği kadar az top']] },
+      { key: 'choreoTolerance', type: 'range', label: 'Enerji toleransı', min: 0, max: 0.4, step: 0.02, fmt: fmtPct,
+        hint: 'Bir sekme doğal sekmeden en fazla bu kadar güçlü/zayıf olabilir (tuşun küçük itmesi). Esneklik %100 iken eşit ritimli notalar zincirlenir.',
         visible: function () { return S.choreoReuse !== 'none'; } },
+      { key: 'choreoTilt', type: 'range', label: 'Tuş eğimi', min: 0, max: 25, step: 1, fmt: function (v) { return Math.round(v) + '°'; },
+        hint: 'Basılan tuşun eğimi topu en fazla bu açının iki katı döndürebilir; yakın tuşlara geçişi bu sağlar. 0°: top yön değiştirmez.',
+        visible: function () { return S.choreoReuse === 'max'; } },
       { key: 'choreoMaxHop', type: 'range', label: 'Azami sıçrama yüksekliği', min: 0.1, max: 1, step: 0.05, fmt: fmtPct,
-        hint: 'Boş yüksekliğe göre. Uzun aralar yüksek sıçrama ister.', visible: function () { return S.choreoReuse !== 'none'; } },
+        hint: 'Boş yüksekliğe göre. Uzun aralar yüksek sıçrama ister; sığmayan nota yeni topla çalınır.', visible: function () { return S.choreoReuse !== 'none'; } },
       { key: 'choreoMaxSpeed', type: 'range', label: 'Azami yatay hız', min: 2, max: 40, step: 1, fmt: fmtInt,
         hint: 'Uzak tuşlara hızlı geçişleri sınırlar.', visible: function () { return S.choreoReuse !== 'none'; } },
       { key: 'choreoSize', type: 'select', label: 'Top boyutu', options: [
@@ -127,7 +130,7 @@
       { key: 'launchSpread', type: 'range', label: 'Atış dağılımı', min: 0, max: 0.5, step: 0.05, fmt: fmtPct,
         visible: function () { return S.launchFrom === 'random'; } },
       { key: 'launchHeight', type: 'range', label: 'Atış yüksekliği', min: 0.2, max: 1, step: 0.05, fmt: fmtPct,
-        hint: 'Düşük atış, topun daha kısa sürede inmesi demek.' }
+        hint: 'Atış yeri ve yüksekliği tek notalık toplar için. Birkaç nota çalan top, ilk sekmesine uyan yükseklikten ve hızla kendiliğinden girer.' }
     ] },
     { title: 'Fizik', items: [
       { key: 'collisions', type: 'toggle', label: 'Toplar birbirine çarpsın' },
@@ -198,8 +201,10 @@
   var songBeat = 0;        // choreography playhead, in beats
   var songOffset = 0;      // beats added for each loop of the song
   var songDone = false;
-  var plan = null;         // choreography: which notes each ball plays
-  var chainNext = 0;       // next ball (chain) to launch
+  var plan = null;         // choreography plan of the first repetition (for the status line)
+  var pending = [];        // queued ball launches: { beat, chain, offset }
+  var plannedOffset = 0;   // song offset (beats) of the next repetition to plan
+  var debugHit = null;     // optional hook for tests: called on every choreographed hop
 
   var pointer = { x: -1, y: -1, inside: false, dragging: null };
 
@@ -239,7 +244,8 @@
       case 'reverb': SoundEngine.setReverb(S.reverb); break;
       case 'scale': case 'root': case 'baseOctave': case 'octaves': buildKeys(); break;
       case 'mode': case 'song': case 'customSong': loadSong(key === 'mode'); break;
-      case 'choreoReuse': case 'choreoMaxBalls': case 'choreoMaxHop': case 'choreoMaxSpeed':
+      case 'gravity': case 'tempo': if (S.mode === 'choreo') renderModeStatus(); break;
+      case 'choreoReuse': case 'choreoTolerance': case 'choreoTilt': case 'choreoMaxHop': case 'choreoMaxSpeed': case 'restitution':
       case 'choreoSize': case 'launchFrom': case 'launchSpread': case 'launchHeight':
         if (S.mode === 'choreo') { restartSong(); renderModeStatus(); }
         break;
@@ -366,8 +372,10 @@
       // real hit time and position corrects any drift along the way.
       var T = Math.max(2, (next.beat - songBeat) * framesPerBeat());
       var idx = keyIndexOfMidi(next.midi);
+      var vxIn = b.vx, vyNatural = -b.vy;      // after the bounce: |vy| = e · impact
       b.vx = (keyCenter(idx) - b.x) / T;
       b.vy = -b.g * T / 2;
+      if (debugHit) debugHit({ vyNatural: vyNatural, vyOut: -b.vy, vxIn: vxIn, vxOut: b.vx });
       b.midi = next.midi;
       b.noteBeats = next.beats;
       b.hopCooldown = T * 0.5;
@@ -412,11 +420,15 @@
     songNext = 0;
     songOffset = 0;
     songDone = false;
-    chainNext = 0;
-    plan = song && W ? planChoreo() : null;
-    // Start early enough that the first ball can fall the whole way.
-    songBeat = song && song.notes.length ? -dropPlan().frames / framesPerBeat() - 0.25 : 0;
+    plan = null;
+    pending = [];
+    plannedOffset = 0;
     balls = balls.filter(function (b) { return !b.scripted; });
+    songBeat = 0;
+    if (!song || !W || !playableNotes()) return;
+    enqueueLoop();
+    // Start early enough that the first ball can make its whole entrance.
+    songBeat = Math.min(0, pending.length ? pending[0].beat : 0) - 0.25;
   }
 
   function playableNotes() {
@@ -465,77 +477,140 @@
   }
 
   /*
-   * Assign the song's notes to balls. A ball that has just played a note can
-   * hop to a later one if the arc fits: height g·T²/8 and sideways speed Δx/T
-   * must stay within the limits from the panel. Otherwise a new ball is dropped.
-   * With a ball limit, the closest-fitting ball is reused even if its arc breaks
-   * the limits (it may leave the top of the screen and come back on time).
+   * Assign the song's notes to balls so that every ball moves like a real one:
+   * between two hits it flies a free parabola, its sideways speed stays the same,
+   * and each bounce gives back e (restitution) of the vertical speed — so the
+   * time between bounces goes T, e·T, e²·T, ...
+   *
+   * A note can therefore continue a ball's chain only if its timing fits that
+   * pattern (within the energy tolerance: the small push a key may give) and the
+   * change of direction can come from the pressed key's tilt: bouncing off a
+   * surface tilted by θ turns the ball by up to 2θ, i.e. |Δvx| ≤ tan(2θ)·vy.
+   * Repeated notes and evenly timed steps to nearby keys chain naturally;
+   * everything else gets its own ball.
    */
   function planChoreo() {
     var fpb = framesPerBeat();
     var drop = dropPlan();
-    var chains = [];
+    var e = Math.max(0.05, S.restitution);
+    var tol = S.choreoTolerance;
+    var tilt = S.choreoReuse === 'max' ? Math.tan(2 * S.choreoTilt * Math.PI / 180) : 0;
     var canHop = drop.g >= 0.02 && S.choreoReuse !== 'none';
     var maxHop = S.choreoMaxHop * drop.room;
+    var maxT = canHop ? Math.sqrt(8 * maxHop / drop.g) : 0;   // longest hop that fits under the limit
 
+    var P = [];
     song.notes.forEach(function (n) {
       if (n.midi === null) return;
       var idx = keyIndexOfMidi(n.midi);
-      if (idx < 0) return;
-      var x = keyCenter(idx), t = n.beat * fpb;
-
-      var best = null, bestCost = Infinity, closest = null, closestCost = Infinity, onStage = 0;
-      chains.forEach(function (c) {
-        if (c.lastT + 45 > t) onStage++;          // still playing or fading out
-        if (!canHop) return;
-        var T = t - c.lastT;
-        if (T < 3) return;
-        var dx = Math.abs(x - c.lastX);
-        var hop = drop.g * T * T / 8, speed = dx / T;
-        var over = Math.max(0, hop / maxHop - 1) + Math.max(0, speed / S.choreoMaxSpeed - 1);
-        if (over < closestCost) { closest = c; closestCost = over; }
-        if (over > 0) return;
-        if (S.choreoReuse === 'repeat' && c.lastMidi !== n.midi) return;
-        var cost = dx + T * 0.05;                  // prefer short moves, then recent balls
-        if (cost < bestCost) { best = c; bestCost = cost; }
-      });
-      if (!best && canHop && S.choreoMaxBalls > 0 && onStage >= S.choreoMaxBalls) best = closest;
-
-      if (best) {
-        best.notes.push(n);
-      } else {
-        best = { notes: [n], size: chainSize() };
-        chains.push(best);
-      }
-      best.lastT = t;
-      best.lastX = x;
-      best.lastMidi = n.midi;
+      if (idx >= 0) P.push({ note: n, t: n.beat * fpb, x: keyCenter(idx) });
     });
+    var N = P.length;
+    var alive = P.map(function () { return true; });
 
-    var peak = 0;
-    chains.forEach(function (c) { peak = Math.max(peak, c.notes.length); });
-    return { chains: chains, notes: playableNotes(), longest: peak };
+    // One hop a -> b is possible on its own.
+    function hopOK(a, b) {
+      var T = b.t - a.t;
+      if (T < 4 || T > maxT) return false;
+      var dx = b.x - a.x;
+      if (S.choreoReuse === 'repeat' && dx !== 0) return false;
+      return Math.abs(dx / T) <= S.choreoMaxSpeed;
+    }
+    // Hop b -> c can follow hop a -> b: bounce energy and key tilt allow it.
+    function followOK(a, b, c) {
+      var T1 = b.t - a.t, T2 = c.t - b.t;
+      if (Math.abs(T2 - e * T1) > tol * e * T1 + 1e-9) return false;
+      var dVx = Math.abs((c.x - b.x) / T2 - (b.x - a.x) / T1);
+      return dVx <= tilt * drop.g * T2 / 2 + 1e-9;
+    }
+
+    var chains = [];
+    while (canHop) {
+      // best[i*N+j] = longest chain (in notes) whose last two notes are i, j.
+      var best = new Map(), bestLen = 0, bestEnd = null;
+      for (var j = 0; j < N; j++) {
+        if (!alive[j]) continue;
+        for (var i = j - 1; i >= 0 && P[j].t - P[i].t <= maxT; i--) {
+          if (!alive[i] || !hopOK(P[i], P[j])) continue;
+          var len = 2, prev = -1;
+          for (var k = i - 1; k >= 0 && P[i].t - P[k].t <= maxT; k--) {
+            var ki = best.get(k * N + i);
+            if (ki && ki.len + 1 > len && followOK(P[k], P[i], P[j])) { len = ki.len + 1; prev = k; }
+          }
+          best.set(i * N + j, { len: len, prev: prev });
+          if (len > bestLen) { bestLen = len; bestEnd = [i, j]; }
+        }
+      }
+      if (!bestEnd) break;
+      var seq = [bestEnd[1], bestEnd[0]], a = bestEnd[0], b = bestEnd[1];
+      while (true) {
+        var cur = best.get(a * N + b);
+        if (cur.prev < 0) break;
+        seq.push(cur.prev);
+        b = a; a = cur.prev;
+      }
+      seq.reverse();
+      seq.forEach(function (q) { alive[q] = false; });
+      chains.push({ notes: seq.map(function (q) { return P[q].note; }), points: seq.map(function (q) { return P[q]; }) });
+    }
+    for (var q = 0; q < N; q++) if (alive[q]) chains.push({ notes: [P[q].note], points: [P[q]] });
+
+    chains.forEach(function (c) {
+      c.size = chainSize();
+      if (c.points.length >= 2) {
+        c.firstPeriod = c.points[1].t - c.points[0].t;
+        c.firstVx = (c.points[1].x - c.points[0].x) / c.firstPeriod;
+      }
+      c.launch = launchFor(c, drop, e, fpb);
+    });
+    chains.sort(function (x, y) { return x.notes[0].beat - y.notes[0].beat; });
+
+    var longest = 0;
+    chains.forEach(function (c) { longest = Math.max(longest, c.notes.length); });
+    return { chains: chains, notes: N, longest: longest, fpb: fpb };
+  }
+
+  // Where and how a chain's ball enters so that it reaches its first key on time.
+  function launchFor(c, drop, e, fpb) {
+    var r = SIZES[c.size].r * S.ballScale;
+    var tx = keyCenter(keyIndexOfMidi(c.notes[0].midi));
+    if (c.notes.length >= 2) {
+      // Fall from rest from exactly the height whose bounce gives the first hop.
+      var vyOut = drop.g * c.firstPeriod / 2;
+      var vyIn = vyOut / e;
+      var frames = vyIn / drop.g;
+      var h = vyIn * vyIn / (2 * drop.g);
+      return { frames: frames, x0: tx - c.firstVx * frames, y0: floorY - r - h, vx: c.firstVx, vy0: 0,
+               fadeIn: h < drop.room * 0.35 };
+    }
+    var x0 = launchX(tx, r);
+    return { frames: drop.frames, x0: x0, y0: floorY - r - drop.dist, vx: (tx - x0) / drop.frames, vy0: drop.vy0, fadeIn: false };
+  }
+
+  // Plans one more repetition of the song and queues its balls.
+  function enqueueLoop() {
+    var p = planChoreo();
+    if (!plan) plan = p;
+    var offset = plannedOffset;
+    p.chains.forEach(function (c) {
+      pending.push({ beat: offset + c.notes[0].beat - c.launch.frames / p.fpb, chain: c, offset: offset });
+    });
+    pending.sort(function (a, b) { return a.beat - b.beat; });
+    plannedOffset += song.totalBeats + 2;    // two beats of silence between loops
   }
 
   function updateChoreo() {
-    if (!song || songDone || !plan) return;
-    var fpb = framesPerBeat();
-    var drop = dropPlan();
+    if (!song || !plan || !plan.notes) return;
+    var loopLen = song.totalBeats + 2;
+    // Keep one repetition planned ahead so long lead-ins are never late.
+    if (S.loop && songBeat > plannedOffset - 2 * loopLen) enqueueLoop();
 
-    while (true) {
-      if (chainNext >= plan.chains.length) {
-        if (!S.loop || !plan.chains.length) { songDone = true; return; }
-        songOffset += song.totalBeats + 2;    // two beats of silence between loops
-        plan = planChoreo();                  // re-plan with the current settings
-        chainNext = 0;
-        renderModeStatus();
-      }
-      var chain = plan.chains[chainNext];
-      var launchBeat = songOffset + chain.notes[0].beat - drop.frames / fpb;
-      if (songBeat < launchBeat) return;
-      launchChain(chain, drop, (songBeat - launchBeat) * fpb);
-      chainNext++;
+    var fpb = framesPerBeat();
+    while (pending.length && pending[0].beat <= songBeat) {
+      var job = pending.shift();
+      launchChain(job.chain, job.offset, (songBeat - job.beat) * fpb);
     }
+    if (!pending.length && !S.loop) songDone = true;
   }
 
   function launchX(tx, r) {
@@ -548,27 +623,21 @@
     }
   }
 
-  function launchChain(chain, drop, late) {
+  function launchChain(chain, offset, late) {
+    var L = chain.launch;
     var first = chain.notes[0];
-    var idx = keyIndexOfMidi(first.midi);
-    if (idx < 0) return;
-    var size = chain.size;
-    var r = SIZES[size].r * S.ballScale;
-    var y0 = floorY - r - drop.dist;
-    var tx = keyCenter(idx);
-    var x0 = launchX(tx, r);
-    var vx = (tx - x0) / drop.frames;
-    var t = Math.min(late, drop.frames - 1);   // catch up if we launched a little late
+    var g = dropPlan().g;
+    var t = Math.min(late, L.frames - 1);      // catch up if we launched a little late
     balls.push({
       id: ballId,
-      size: size,
-      r: r,
-      g: drop.g,
-      x: x0 + vx * t,
-      y: y0 + drop.vy0 * t + 0.5 * drop.g * t * t,
-      vx: vx,
-      vy: drop.vy0 + drop.g * t,
-      px: x0,
+      size: chain.size,
+      r: SIZES[chain.size].r * S.ballScale,
+      g: g,
+      x: L.x0 + L.vx * t,
+      y: L.y0 + L.vy0 * t + 0.5 * g * t * t,
+      vx: L.vx,
+      vy: L.vy0 + g * t,
+      px: L.x0,
       color: 'hsl(' + ((ballId * 137.508) % 360).toFixed(1) + ', 80%, 62%)',
       cooldown: 0,
       hopCooldown: 0,
@@ -576,10 +645,11 @@
       midi: first.midi,
       noteBeats: first.beats,
       queue: chain.notes.slice(1).map(function (n) {
-        return { midi: n.midi, beats: n.beats, beat: n.beat + songOffset };
+        return { midi: n.midi, beats: n.beats, beat: n.beat + offset };
       }),
       spent: false,
-      alpha: 1
+      alpha: L.fadeIn ? 0 : 1,
+      fadingIn: L.fadeIn
     });
     ballId++;
   }
@@ -625,7 +695,8 @@
       }
     }
 
-    if (b.spent) b.alpha -= 0.025 * h;   // a choreographed ball fades out after its note
+    if (b.spent) b.alpha -= 0.025 * h;   // a choreographed ball fades out after its last note
+    else if (b.fadingIn) { b.alpha = Math.min(1, b.alpha + 0.08 * h); if (b.alpha >= 1) b.fadingIn = false; }
 
     // Barriers: resolve once per ball, on the side the ball came from.
     if (b.scripted || S.mode === 'choreo') return;
@@ -723,7 +794,7 @@
         }
       }
     }
-    balls = balls.filter(function (b) { return !b.scripted || b.alpha > 0; });
+    balls = balls.filter(function (b) { return !b.scripted || b.alpha > 0 || b.fadingIn; });
   }
 
   var lastTime = performance.now();
@@ -1013,7 +1084,8 @@
       if (!plan || !plan.notes) cs.textContent = '';
       else if (S.choreoReuse !== 'none' && S.gravity < 0.02) cs.textContent = 'Yerçekimi olmadan top sıçrayamaz; her nota yeni top.';
       else cs.textContent = plan.notes + ' nota, ' + plan.chains.length + ' topla çalınıyor' +
-        (plan.chains.length < plan.notes ? ' (bir top en fazla ' + plan.longest + ' nota).' : '.');
+        (plan.chains.length < plan.notes ? ' (bir top en fazla ' + plan.longest + ' nota).' : '.') +
+        (S.choreoReuse === 'max' && plan.longest < 4 ? ' Daha uzun zincirler için yerçekimini veya tuş eğimini artırın ya da tempoyu düşürün (değişiklik şarkı baştan başlayınca uygulanır).' : '');
     }
   }
 
@@ -1190,6 +1262,8 @@
     get song() { return song; },
     get songNext() { return songNext; },
     get plan() { return plan; },
+    get pending() { return pending; },
+    set onHop(fn) { debugHit = fn; },
     spawnBall: spawnBall,
     addBarrier: addBarrier,
     reset: reset
