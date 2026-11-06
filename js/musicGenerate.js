@@ -48,6 +48,8 @@
     choreoTolerance: 0.1,
     choreoTilt: 12,
     choreoWalls: true,
+    choreoCeiling: true,
+    choreoMirrors: true,
     choreoMaxHop: 0.8,
     choreoMaxSpeed: 14,
     choreoSize: 'mixed',
@@ -122,6 +124,12 @@
         visible: function () { return S.choreoReuse === 'max'; } },
       { key: 'choreoWalls', type: 'toggle', label: 'Duvarlardan yansıyabilsin',
         hint: 'Top yan duvarlara ayna gibi çarpıp yön değiştirerek uzak ya da geri yöndeki tuşa geçebilir.',
+        visible: function () { return S.choreoReuse === 'max'; } },
+      { key: 'choreoCeiling', type: 'toggle', label: 'Tavandan yansıyabilsin',
+        hint: 'Fazla enerjili top üst kenara çarpıp daha kısa sürede geri iner.',
+        visible: function () { return S.choreoReuse === 'max'; } },
+      { key: 'choreoMirrors', type: 'toggle', label: 'Geçici aynalar',
+        hint: 'Gerektiğinde topun yolunda kısa süreliğine bir ayna belirir; top ondan yansıyınca kaybolur. Dikey ayna yönü, yatay ayna sekme süresini değiştirir.',
         visible: function () { return S.choreoReuse === 'max'; } },
       { key: 'choreoMaxHop', type: 'range', label: 'Azami sıçrama yüksekliği', min: 0.1, max: 1, step: 0.05, fmt: fmtPct,
         hint: 'Boş yüksekliğe göre. Uzun aralar yüksek sıçrama ister; sığmayan nota yeni topla çalınır.', visible: function () { return S.choreoReuse !== 'none'; } },
@@ -250,7 +258,7 @@
       case 'scale': case 'root': case 'baseOctave': case 'octaves': buildKeys(); break;
       case 'mode': case 'song': case 'customSong': loadSong(key === 'mode'); break;
       case 'gravity': case 'tempo': if (S.mode === 'choreo') renderModeStatus(); break;
-      case 'choreoReuse': case 'choreoTolerance': case 'choreoTilt': case 'choreoWalls': case 'choreoMaxHop': case 'choreoMaxSpeed': case 'restitution':
+      case 'choreoReuse': case 'choreoTolerance': case 'choreoTilt': case 'choreoWalls': case 'choreoCeiling': case 'choreoMirrors': case 'choreoMaxHop': case 'choreoMaxSpeed': case 'restitution':
       case 'choreoSize': case 'launchFrom': case 'launchSpread': case 'launchHeight':
         if (S.mode === 'choreo') { restartSong(); renderModeStatus(); }
         break;
@@ -379,12 +387,10 @@
       var idx = keyIndexOfMidi(next.midi);
       var vxIn = b.vx, vyNatural = -b.vy;      // after the bounce: |vy| = e · impact
       var landErr = Math.abs(b.x - keyCenter(keyIndexOfMidi(b.midi)));
-      var prevVia = b.via;
-      b.vx = hopVelocity(next.via, b.x, keyCenter(idx), T, b.r, b.e).out;
-      b.via = next.via;
-      b.mirrored = false;
-      b.vy = -b.g * T / 2;
-      if (debugHit) debugHit({ vyNatural: vyNatural, vyOut: -b.vy, vxIn: vxIn, vxOut: b.vx, via: next.via, prevVia: prevVia, landErr: landErr });
+      var prevHop = b.hop;
+      aimHop(b, next.hop, keyCenter(idx), T);
+      if (debugHit) debugHit({ vyNatural: vyNatural, vyOut: -b.vy, vxIn: vxIn, vxOut: b.vx, hop: next.hop,
+                               prevHop: prevHop, landErr: landErr, ball: b.id, T: T, r: b.r, x: b.x });
       b.midi = next.midi;
       b.noteBeats = next.beats;
       b.hopCooldown = T * 0.5;
@@ -437,6 +443,7 @@
     songDone = false;
     plan = null;
     pending = [];
+    mirrors = [];
     plannedOffset = 0;
     balls = balls.filter(function (b) { return !b.scripted; });
     songBeat = 0;
@@ -504,30 +511,78 @@
    * Repeated notes and evenly timed steps to nearby keys chain naturally;
    * everything else gets its own ball.
    */
-  // Ways to fly from one key to the next: straight, or mirrored once off a side wall.
-  var VIA_DIRECT = 0, VIA_RIGHT = 1, VIA_LEFT = 2;
-
-  // Horizontal speed leaving x1 and arriving at x2 after T frames along `via`.
-  // A wall returns e of the horizontal speed, like the floor does vertically.
-  function hopVelocity(via, x1, x2, T, r, e) {
-    if (via === VIA_DIRECT) { var v = (x2 - x1) / T; return { out: v, inn: v }; }
-    var wall = via === VIA_RIGHT ? W - r : r;
-    var d1 = Math.abs(wall - x1), d2 = Math.abs(wall - x2);
-    var out = (d1 + d2 / e) / T * (via === VIA_RIGHT ? 1 : -1);
+  /*
+   * Hop geometry. A hop leaves the keys with (vx, -vy) and lands T frames later.
+   *
+   * Horizontally it flies straight (D), or mirrors once off the right wall (R),
+   * the left wall (L) or a temporary mirror (M) placed in its path.
+   * Vertically it flies a free parabola (F), or mirrors once off the ceiling
+   * (C) or a temporary horizontal mirror (H) above the keys.
+   * Every mirror returns e (restitution) of the speed across it, like the floor.
+   */
+  // Horizontal speed leaving x1 and arriving at x2 after T frames along path `kind`
+  // (mirrorCenter: where the ball's centre turns at a temporary mirror).
+  function hopVelocity(kind, x1, x2, T, r, e, mirrorCenter) {
+    if (kind === 'D') { var v = (x2 - x1) / T; return { out: v, inn: v }; }
+    var wall = kind === 'R' ? W - r : kind === 'L' ? r : mirrorCenter.at;
+    var dir = kind === 'R' ? 1 : kind === 'L' ? -1 : mirrorCenter.dir;
+    var out = (Math.abs(wall - x1) + Math.abs(wall - x2) / e) / T * dir;
     return { out: out, inn: -e * out };
+  }
+
+  // Flight with a ceiling `hc` above the take-off height (centre to centre):
+  // leaves upward at v0; returns { T, vLand } (frames, landing speed).
+  function ceilingFlight(v0, hc, g, e) {
+    var disc = v0 * v0 - 2 * g * hc;
+    if (disc <= 0) return { T: 2 * v0 / g, vLand: v0, touches: false };
+    var vAt = Math.sqrt(disc);
+    var t1 = (v0 - vAt) / g;
+    var u = e * vAt;
+    var vLand = Math.sqrt(u * u + 2 * g * hc);
+    return { T: t1 + (vLand - u) / g, vLand: vLand, touches: true };
+  }
+
+  // Take-off speed that lands after T frames with a ceiling at hc (null if T is too long for it).
+  function solveCeilingV0(T, hc, g, e) {
+    var lo = Math.sqrt(2 * g * hc);
+    if (T >= ceilingFlight(lo * 1.000001, hc, g, e).T) return null;
+    var hi = lo;
+    while (ceilingFlight(hi, hc, g, e).T > T) hi *= 2;
+    for (var k = 0; k < 50; k++) {
+      var mid = (lo + hi) / 2;
+      if (ceilingFlight(mid, hc, g, e).T > T) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
+  }
+
+  // Height of a horizontal mirror that turns a take-off at v0 into a hop of T frames.
+  function solveMirrorHeight(v0, T, g, e) {
+    var top = v0 * v0 / (2 * g);
+    if (T >= 2 * v0 / g) return null;        // the free hop is already shorter
+    var lo = 0, hi = top;
+    for (var k = 0; k < 50; k++) {
+      var mid = (lo + hi) / 2;
+      if (ceilingFlight(v0, mid, g, e).T < T) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
   }
 
   function planChoreo() {
     var fpb = framesPerBeat();
     var drop = dropPlan();
+    var g = drop.g;
     var e = Math.max(0.05, S.restitution);
     var tol = S.choreoTolerance;
     var tilt = S.choreoReuse === 'max' ? Math.tan(2 * S.choreoTilt * Math.PI / 180) : 0;
-    var canHop = drop.g >= 0.02 && S.choreoReuse !== 'none';
-    var vias = S.choreoReuse === 'max' && S.choreoWalls ? [VIA_DIRECT, VIA_RIGHT, VIA_LEFT] : [VIA_DIRECT];
-    var maxHop = S.choreoMaxHop * drop.room;
-    var maxT = canHop ? Math.sqrt(8 * maxHop / drop.g) : 0;   // longest hop that fits under the limit
-    var rPlan = SIZES[1].r * S.ballScale;                     // walls are aimed again with the real radius
+    var canHop = g >= 0.02 && S.choreoReuse !== 'none';
+    var full = S.choreoReuse === 'max';
+    var useWalls = full && S.choreoWalls, useCeiling = full && S.choreoCeiling, useMirrors = full && S.choreoMirrors;
+    var rPlan = SIZES[1].r * S.ballScale;                     // mirrors are aimed again with the real radius
+    var ceilingH = Math.max(10, floorY - 2 * rPlan);          // take-off centre to ceiling-contact centre
+    var maxHop = Math.min(S.choreoMaxHop * drop.room, ceilingH);
+    var maxT = canHop ? Math.sqrt(8 * maxHop / g) : 0;        // longest free hop under the limit
+    var minMirror = rPlan * 1.5;                              // a horizontal mirror stays clear of the keys
+    var graze = 12;                                           // a reflection must be a real contact, not a graze
 
     var P = [];
     song.notes.forEach(function (n) {
@@ -537,98 +592,144 @@
     });
     var N = P.length;
     var alive = P.map(function () { return true; });
-    var V = vias.length;
+    // Hops longer than a free hop under the limit need a ceiling or a mirror; those
+    // only shorten hops, so this window is still the longest gap worth checking.
+    var windowT = maxT;
 
-    // One hop a -> b along a given path, or null if it isn't possible on its own.
-    function hop(a, b, via) {
-      var T = b.t - a.t;
-      if (T < 4 || T > maxT) return null;
-      if (S.choreoReuse === 'repeat' && b.x !== a.x) return null;
-      var v = hopVelocity(via, a.x, b.x, T, rPlan, e);
-      if (Math.abs(v.out) > S.choreoMaxSpeed) return null;
-      return v;
+    // Vertical options for a hop of T frames; `vyIn` is the arrival speed of the
+    // previous hop (null for the first hop, whose drop is chosen to match).
+    function verticals(T, vyIn) {
+      var out = [];
+      var vF = g * T / 2;
+      if (g * T * T / 8 <= maxHop + 1e-9) out.push({ y: 'F', vyOut: vF, vyIn: vF });
+      if (useCeiling) {
+        var v0 = solveCeilingV0(T, ceilingH, g, e);
+        if (v0 && v0 * v0 / (2 * g) >= ceilingH + graze) out.push({ y: 'C', vyOut: v0, vyIn: ceilingFlight(v0, ceilingH, g, e).vLand });
+      }
+      if (useMirrors && vyIn) {
+        var vH = e * vyIn, hc = solveMirrorHeight(vH, T, g, e);
+        if (hc !== null && hc >= minMirror && hc <= ceilingH - rPlan && vH * vH / (2 * g) - hc >= graze)
+          out.push({ y: 'H', vyOut: vH, vyIn: ceilingFlight(vH, hc, g, e).vLand, hc: hc });
+      }
+      if (vyIn) out = out.filter(function (o) { return Math.abs(o.vyOut - e * vyIn) <= tol * e * vyIn + 1e-9; });
+      return out;
     }
-    // The bounce at b, between arriving with vIn (after hop of length T1) and
-    // leaving with vOut (hop of length T2), respects energy and key tilt.
-    function bounceOK(T1, vIn, T2, vOut) {
-      if (Math.abs(T2 - e * T1) > tol * e * T1 + 1e-9) return false;
-      return Math.abs(vOut - vIn) <= tilt * drop.g * T2 / 2 + 1e-9;
+
+    // Horizontal options from a to b; `vxIn` = arrival speed of the previous hop.
+    function horizontals(a, b, T, vxIn, vyOut) {
+      var out = [];
+      var allow = tilt * vyOut;
+      function add(kind, mc) {
+        var v = hopVelocity(kind, a.x, b.x, T, rPlan, e, mc === undefined ? undefined : { at: mc, dir: vxIn > 0 ? 1 : -1 });
+        if (Math.abs(v.out) > S.choreoMaxSpeed) return;
+        if (vxIn !== null && Math.abs(v.out - vxIn) > allow + 1e-9) return;
+        out.push({ x: kind, vxOut: v.out, vxIn: v.inn, mc: mc });
+      }
+      if (S.choreoReuse === 'repeat' && b.x !== a.x) return out;
+      add('D');
+      if (useWalls) { add('R'); add('L'); }
+      if (useMirrors && vxIn !== null && Math.abs(vxIn) > 0.05) {
+        // Keep going the same way at the same speed and bounce back off a mirror
+        // placed so the ball lands on b in time; speed up a little (key tilt) if needed.
+        var dir = vxIn > 0 ? 1 : -1, speed = Math.abs(vxIn);
+        var far = dir > 0 ? Math.max(a.x, b.x) : Math.min(a.x, b.x);
+        var need = (Math.abs(far - a.x) + Math.abs(far - b.x) / e) / T + 0.01;
+        if (speed < need && need - speed <= allow) speed = need;
+        var mc = (speed * T * dir + a.x + b.x / e) / (1 + 1 / e);
+        if (dir < 0) mc = (a.x + b.x / e - speed * T) / (1 + 1 / e);
+        var inside = mc >= rPlan && mc <= W - rPlan;
+        var beyond = dir > 0 ? mc >= far : mc <= far;
+        if (inside && beyond && speed <= S.choreoMaxSpeed) out.push({ x: 'M', vxOut: speed * dir, vxIn: -e * speed * dir, mc: mc });
+      }
+      return out;
+    }
+
+    // Best hop a -> b after arriving with (vxIn, vyIn): prefer natural flight,
+    // then real walls/ceiling, then temporary mirrors.
+    function bestHop(a, b, vxIn, vyIn) {
+      var T = b.t - a.t;
+      if (T < 4 || T > windowT + 1e-9 && !useCeiling && !useMirrors) return null;
+      var vs = verticals(T, vyIn), best = null, bestScore = Infinity;
+      vs.forEach(function (v) {
+        horizontals(a, b, T, vxIn, v.vyOut).forEach(function (h) {
+          var mirrors = (h.x === 'M' ? 1 : 0) + (v.y === 'H' ? 1 : 0);
+          var real = (h.x === 'R' || h.x === 'L' ? 1 : 0) + (v.y === 'C' ? 1 : 0);
+          var score = mirrors * 10 + real;
+          if (score < bestScore) { bestScore = score; best = { x: h.x, mc: h.mc, vxOut: h.vxOut, vxIn: h.vxIn,
+            y: v.y, hc: v.hc, vyOut: v.vyOut, vyIn: v.vyIn, mirrors: mirrors, real: real }; }
+        });
+      });
+      return best;
     }
 
     var chains = [];
     while (canHop) {
-      // best[(i*N+j)*V+v] = longest chain whose last hop is i -> j along vias[v].
-      var best = new Map(), bestKey = -1, bestLen = 0, bestWalls = 0;
+      // endAt[j] = chain states whose last note is j: { len, mirrors, prev, i, j, hop }
+      var endAt = P.map(function () { return []; });
+      var top = null;
       for (var j = 0; j < N; j++) {
         if (!alive[j]) continue;
-        for (var i = j - 1; i >= 0 && P[j].t - P[i].t <= maxT; i--) {
+        var bucket = {};
+        for (var i = j - 1; i >= 0 && P[j].t - P[i].t <= Math.max(windowT, 1) * 3; i--) {
           if (!alive[i]) continue;
-          var T2 = P[j].t - P[i].t;
-          for (var v = 0; v < V; v++) {
-            var h2 = hop(P[i], P[j], vias[v]);
-            if (!h2) continue;
-            var len = 2, walls = v ? 1 : 0, prev = -1;
-            for (var k = i - 1; k >= 0 && P[i].t - P[k].t <= maxT; k--) {
-              for (var u = 0; u < V; u++) {
-                var st = best.get((k * N + i) * V + u);
-                if (!st) continue;
-                var cand = st.len + 1, candWalls = st.walls + (v ? 1 : 0);
-                if (cand < len || (cand === len && candWalls >= walls)) continue;
-                if (!bounceOK(P[i].t - P[k].t, st.vIn, T2, h2.out)) continue;
-                len = cand; walls = candWalls; prev = (k * N + i) * V + u;
-              }
-            }
-            var key = (i * N + j) * V + v;
-            best.set(key, { len: len, walls: walls, prev: prev, i: i, j: j, via: vias[v], vIn: h2.inn, vOut: h2.out });
-            if (len > bestLen || (len === bestLen && walls < bestWalls)) { bestLen = len; bestWalls = walls; bestKey = key; }
+          var cands = [{ len: 1, mirrors: 0, real: 0, st: null }];
+          endAt[i].forEach(function (st) { cands.push({ len: st.len, mirrors: st.mirrors, real: st.real, st: st }); });
+          for (var c = 0; c < cands.length; c++) {
+            var pre = cands[c];
+            var hp = bestHop(P[i], P[j], pre.st ? pre.st.hop.vxIn : null, pre.st ? pre.st.hop.vyIn : null);
+            if (!hp) continue;
+            var cand = { len: pre.len + 1, mirrors: pre.mirrors + hp.mirrors, real: pre.real + hp.real, prev: pre.st, i: i, j: j, hop: hp };
+            var key = i + ':' + hp.x + hp.y;
+            var cur = bucket[key];
+            if (!cur || cand.len > cur.len || (cand.len === cur.len && cand.mirrors * 10 + cand.real < cur.mirrors * 10 + cur.real)) bucket[key] = cand;
           }
         }
+        Object.keys(bucket).forEach(function (k) {
+          var st = bucket[k];
+          endAt[j].push(st);
+          if (!top || st.len > top.len || (st.len === top.len && st.mirrors * 10 + st.real < top.mirrors * 10 + top.real)) top = st;
+        });
       }
-      if (bestKey < 0) break;
-      // Walk back: collect notes and the path used for every hop.
-      var idxs = [], hopVias = [], key2 = bestKey, firstOut = 0;
-      while (key2 >= 0) {
-        var stt = best.get(key2);
+      if (!top) break;
+      var idxs = [], hops = [];
+      for (var stt = top; stt; stt = stt.prev) {
         idxs.push(stt.j);
-        hopVias.push(stt.via);
-        firstOut = stt.vOut;
-        if (stt.prev < 0) idxs.push(stt.i);
-        key2 = stt.prev;
+        hops.push(stt.hop);
+        if (!stt.prev) idxs.push(stt.i);
       }
       idxs.reverse();
-      hopVias.reverse();
+      hops.reverse();
       idxs.forEach(function (q) { alive[q] = false; });
-      chains.push({
-        notes: idxs.map(function (q) { return P[q].note; }),
-        vias: hopVias,                 // vias[h] = path of the hop into notes[h + 1]
-        firstPeriod: P[idxs[1]].t - P[idxs[0]].t,
-        firstVx: firstOut
-      });
+      chains.push({ notes: idxs.map(function (q) { return P[q].note; }), hops: hops });
     }
-    for (var q = 0; q < N; q++) if (alive[q]) chains.push({ notes: [P[q].note], vias: [] });
+    for (var q = 0; q < N; q++) if (alive[q]) chains.push({ notes: [P[q].note], hops: [] });
 
-    var longest = 0, wallHops = 0;
+    var longest = 0, used = { walls: 0, ceiling: 0, mirrors: 0 };
     chains.forEach(function (c) {
       c.size = chainSize();
       c.launch = launchFor(c, drop, e, fpb);
       longest = Math.max(longest, c.notes.length);
-      c.vias.forEach(function (v) { if (v) wallHops++; });
+      c.hops.forEach(function (h) {
+        if (h.x === 'R' || h.x === 'L') used.walls++;
+        if (h.y === 'C') used.ceiling++;
+        used.mirrors += h.mirrors;
+      });
     });
     chains.sort(function (x, y) { return x.notes[0].beat - y.notes[0].beat; });
-    return { chains: chains, notes: N, longest: longest, wallHops: wallHops, fpb: fpb };
+    return { chains: chains, notes: N, longest: longest, used: used, fpb: fpb, rPlan: rPlan };
   }
 
   // Where and how a chain's ball enters so that it reaches its first key on time.
   function launchFor(c, drop, e, fpb) {
     var r = SIZES[c.size].r * S.ballScale;
     var tx = keyCenter(keyIndexOfMidi(c.notes[0].midi));
-    if (c.notes.length >= 2) {
+    if (c.hops.length) {
       // Fall from rest from exactly the height whose bounce gives the first hop.
-      var vyOut = drop.g * c.firstPeriod / 2;
-      var vyIn = vyOut / e;
+      var vyIn = c.hops[0].vyOut / e;
       var frames = vyIn / drop.g;
       var h = vyIn * vyIn / (2 * drop.g);
-      return { frames: frames, x0: tx - c.firstVx * frames, y0: floorY - r - h, vx: c.firstVx, vy0: 0,
+      var vx = c.hops[0].vxOut;
+      return { frames: frames, x0: tx - vx * frames, y0: floorY - r - h, vx: vx, vy0: 0,
                fadeIn: h < drop.room * 0.35 };
     }
     var x0 = launchX(tx, r);
@@ -693,11 +794,11 @@
       midi: first.midi,
       noteBeats: first.beats,
       queue: chain.notes.slice(1).map(function (n, h) {
-        return { midi: n.midi, beats: n.beats, beat: n.beat + offset, via: chain.vias[h] || VIA_DIRECT };
+        return { midi: n.midi, beats: n.beats, beat: n.beat + offset, hop: chain.hops[h] };
       }),
       e: Math.max(0.05, S.restitution),
-      via: VIA_DIRECT,
-      mirrored: false,
+      rPlan: plan ? plan.rPlan : SIZES[1].r * S.ballScale,
+      hop: null,
       spent: false,
       alpha: L.fadeIn ? 0 : 1,
       fadingIn: L.fadeIn
@@ -705,10 +806,86 @@
     ballId++;
   }
 
+  // Sets a ball's take-off velocity for its planned hop and shows any temporary
+  // mirror it needs. Aiming from the real time and position removes drift.
+  function aimHop(b, hop, tx, T) {
+    var e = b.e, g = b.g;
+    var plan2 = { x: hop.x, y: hop.y, reflX: null, reflY: null, lineX: null, lineY: null, doneX: false, doneY: false };
+
+    // Vertical
+    var vy = g * T / 2;
+    if (hop.y === 'C' || hop.y === 'H') {
+      var hc = hop.y === 'C' ? (floorY - b.r) - b.r : hop.hc;
+      var v0 = solveCeilingV0(T, hc, g, e);
+      if (v0) {
+        vy = v0;
+        plan2.reflY = (floorY - b.r) - hc;                    // centre height where it reflects
+        plan2.lineY = hop.y === 'H' ? plan2.reflY - b.r : 0;
+      } else {
+        plan2.y = 'F';                                        // can't reach it now: fly freely
+      }
+    }
+
+    // Horizontal
+    var mc;
+    if (hop.x === 'M') {
+      // The ball's centre turns exactly where planned; the temporary mirror is
+      // put one radius beyond it, so it fits this ball whatever its size.
+      var dir = hop.vxOut > 0 ? 1 : -1;
+      mc = { at: hop.mc, dir: dir };
+      plan2.reflX = hop.mc;
+      plan2.lineX = hop.mc + dir * b.r;
+      plan2.dir = dir;
+    } else if (hop.x === 'R') plan2.reflX = W - b.r;
+    else if (hop.x === 'L') plan2.reflX = b.r;
+    b.vx = hopVelocity(hop.x, b.x, tx, T, b.r, e, mc).out;
+    b.vy = -vy;
+    b.hop = plan2;
+
+    if (plan2.x === 'M' || plan2.y === 'H' || plan2.y === 'C') showMirrors(b, plan2, T);
+  }
+
+  // Temporary mirrors (and a flash on the ceiling) along a hop, found by
+  // flying the hop once in advance.
+  var mirrors = [];
+  function showMirrors(b, hp, T) {
+    var x = b.x, y = b.y, vx = b.vx, vy = b.vy, dx = false, dy = false, steps = Math.ceil(T * 2);
+    for (var k = 0; k < steps; k++) {
+      y += vy * 0.5 + 0.125 * b.g;
+      vy += b.g * 0.5;
+      x += vx * 0.5;
+      if (!dx && hp.reflX !== null && (hp.x === 'M') && (hp.dir > 0 ? x >= hp.reflX : x <= hp.reflX)) {
+        dx = true;
+        mirrors.push({ kind: 'v', x: hp.lineX, y: y, ball: b, life: 0, used: false, axis: 'x' });
+        x = 2 * hp.reflX - x; vx = -b.e * vx;
+      } else if (!dx && hp.reflX !== null && (vx > 0 ? x >= hp.reflX : x <= hp.reflX)) {
+        dx = true; x = 2 * hp.reflX - x; vx = -b.e * vx;
+      }
+      if (!dy && hp.reflY !== null && vy < 0 && y <= hp.reflY) {
+        dy = true;
+        mirrors.push({ kind: hp.y === 'C' ? 'c' : 'h', x: x, y: hp.y === 'C' ? 1 : hp.lineY, ball: b, life: 0, used: false, axis: 'y' });
+        y = 2 * hp.reflY - y; vy = b.e * Math.abs(vy);
+      }
+    }
+  }
+
+  function markMirrorUsed(b, axis) {
+    for (var i = 0; i < mirrors.length; i++) {
+      if (mirrors[i].ball === b && mirrors[i].axis === axis && !mirrors[i].used) { mirrors[i].used = true; return; }
+    }
+  }
+
   function stepBall(b, h, g) {
     var e = S.restitution;
     b.px = b.x;
-    b.vy += (b.scripted ? b.g : g * (S.sizeGravity ? SIZES[b.size].g : 1)) * h;
+    if (b.scripted) {
+      // Exact for constant gravity, so planned arcs and landing times match.
+      b.y += b.vy * h + 0.5 * b.g * h * h;
+      b.vy += b.g * h;
+      b.x += b.vx * h;
+    } else {
+      b.vy += g * (S.sizeGravity ? SIZES[b.size].g : 1) * h;
+    }
 
     var speed = Math.hypot(b.vx, b.vy);
     if (!b.scripted && speed > S.maxSpeed) {           // clamp the magnitude, in every direction
@@ -716,8 +893,10 @@
       b.vy *= S.maxSpeed / speed;
     }
 
-    b.x += b.vx * h;
-    b.y += b.vy * h;
+    if (!b.scripted) {
+      b.x += b.vx * h;
+      b.y += b.vy * h;
+    }
     if (b.cooldown > 0) b.cooldown -= h;
 
     // Side walls and ceiling: push out, then reflect. Choreographed balls are
@@ -728,10 +907,18 @@
       if (b.y - b.r < 0) { b.y = b.r; b.vy = Math.abs(b.vy) * e; }
     } else {
       if (b.hopCooldown > 0) b.hopCooldown -= h;
-      // A side wall acts as a mirror only on a hop planned to use it, once.
-      if (!b.spent && !b.mirrored) {
-        if (b.via === VIA_LEFT && b.x < b.r) { b.x = 2 * b.r - b.x; b.vx = Math.abs(b.vx) * b.e; b.mirrored = true; }
-        else if (b.via === VIA_RIGHT && b.x > W - b.r) { b.x = 2 * (W - b.r) - b.x; b.vx = -Math.abs(b.vx) * b.e; b.mirrored = true; }
+      // Walls, the ceiling and temporary mirrors reflect a ball only on a hop
+      // planned to use them, once each.
+      var hp = b.hop;
+      if (hp && !b.spent) {
+        if (!hp.doneX && hp.reflX !== null) {
+          var crossed = hp.x === 'L' ? b.x < hp.reflX : hp.x === 'R' ? b.x > hp.reflX
+            : (hp.dir > 0 ? b.x > hp.reflX : b.x < hp.reflX);
+          if (crossed) { b.x = 2 * hp.reflX - b.x; b.vx = -b.vx * b.e; hp.doneX = true; markMirrorUsed(b, 'x'); }
+        }
+        if (!hp.doneY && hp.reflY !== null && b.vy < 0 && b.y < hp.reflY) {
+          b.y = 2 * hp.reflY - b.y; b.vy = Math.abs(b.vy) * b.e; hp.doneY = true; markMirrorUsed(b, 'y');
+        }
       }
     }
 
@@ -907,6 +1094,8 @@
       ctx.restore();
     }
 
+    drawMirrors(dt);
+
     // Balls
     for (i = 0; i < balls.length; i++) {
       var b = balls[i];
@@ -938,6 +1127,36 @@
     ctx.globalAlpha = 1;
 
     drawKeyboard(keyW, dt);
+  }
+
+  // Temporary mirrors fade in as the ball sets off and fade out once used.
+  function drawMirrors(dt) {
+    for (var i = mirrors.length - 1; i >= 0; i--) {
+      var m = mirrors[i];
+      m.life += dt;
+      if (m.used) m.fade = (m.fade || 0) + dt;
+      var gone = balls.indexOf(m.ball) < 0 || m.life > 600;
+      var a = m.used ? 1 - m.fade / 22 : Math.min(1, m.life / 10);
+      if (a <= 0 || (gone && !m.used)) { mirrors.splice(i, 1); continue; }
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.strokeStyle = m.kind === 'c' ? 'rgba(255, 255, 255, 0.9)' : '#a8e6ff';
+      ctx.shadowColor = '#7fd4ff';
+      ctx.shadowBlur = 12;
+      ctx.lineWidth = m.kind === 'c' ? 4 : 3;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      var half = m.kind === 'v' ? 46 : 52;
+      if (m.kind === 'v') {
+        var cy = clamp(m.y, half + 2, floorY - half - 2);
+        ctx.moveTo(m.x, cy - half); ctx.lineTo(m.x, cy + half);
+      } else {
+        var cx = clamp(m.x, half + 2, W - half - 2);          // keep it fully on screen
+        ctx.moveTo(cx - half, m.y); ctx.lineTo(cx + half, m.y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   function drawKeyboard(keyW, dt) {
@@ -1206,6 +1425,14 @@
     choreo: 'Toplar notaların tam zamanında doğru tuşa düşer; bir top birkaç notayı sıçrayarak çalabilir. Engeller bu modda devre dışı.'
   };
 
+  function usedText(u) {
+    var parts = [];
+    if (u.walls) parts.push(u.walls + ' duvar');
+    if (u.ceiling) parts.push(u.ceiling + ' tavan');
+    if (u.mirrors) parts.push(u.mirrors + ' geçici ayna');
+    return parts.length ? '; yansımalar: ' + parts.join(', ') : '';
+  }
+
   function renderModeStatus() {
     var node = document.getElementById('mode-status');
     if (!node) return;
@@ -1224,7 +1451,7 @@
       else if (S.choreoReuse !== 'none' && S.gravity < 0.02) cs.textContent = 'Yerçekimi olmadan top sıçrayamaz; her nota yeni top.';
       else cs.textContent = plan.notes + ' nota, ' + plan.chains.length + ' topla çalınıyor' +
         (plan.chains.length < plan.notes ? ' (bir top en fazla ' + plan.longest + ' nota' +
-          (plan.wallHops ? ', ' + plan.wallHops + ' geçişte duvar yansıması' : '') + ').' : '.') +
+          usedText(plan.used) + ').' : '.') +
         (S.choreoReuse === 'max' && plan.longest < 4 ? ' Daha uzun zincirler için yerçekimini veya tuş eğimini artırın ya da tempoyu düşürün (değişiklik şarkı baştan başlayınca uygulanır).' : '');
     }
   }
@@ -1403,6 +1630,7 @@
     get songNext() { return songNext; },
     get plan() { return plan; },
     get pending() { return pending; },
+    get mirrors() { return mirrors; },
     set onHop(fn) { debugHit = fn; },
     spawnBall: spawnBall,
     addBarrier: addBarrier,
